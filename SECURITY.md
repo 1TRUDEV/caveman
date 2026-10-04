@@ -113,6 +113,9 @@ send a `session_start` event from a background process. Login is not
 required; events go to `https://xvfgtprkhzlvegvmeefq.supabase.co/functions/v1/cli-telemetry`,
 a Supabase Edge Function that validates each event and stores it in Caveman's
 Supabase database. Its source and table schema live in [`supabase/`](./supabase/).
+`supabase/` also holds the receiver for Caveman Blocks' separate opt-out
+telemetry (the `blocks-telemetry` function and `blocks_events` table), documented at
+<https://github.com/caveman-ai/blocks/blob/main/docs/TELEMETRY.md>.
 
 ```bash
 caveman telemetry status
