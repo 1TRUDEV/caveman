@@ -208,8 +208,11 @@ test("rejects malformed and out-of-contract events", () => {
     ["counter as string", { ...dailyUsage, runs: "31" }],
     ["negative counter", { ...dailyUsage, verify_fail: -1 }],
     ["float counter", { ...dailyUsage, sessions: 2.5 }],
-    ["count too big", { ...dailyUsage, scripts: 2 ** 24 }],
-    ["bytes too big", { ...dailyUsage, bytes_full: 2 ** 40 }],
+    ...["repos_active", "sessions", "scripts", "hints", "hints_followed", "promote_hints", "calls", "runs", "runs_failed",
+      "runs_user", "verify_pass", "verify_fail", "blocks_first_party", "blocks_user"]
+      .map((k): [string, unknown] => [`${k} too big`, { ...dailyUsage, [k]: 2 ** 24 }]),
+    ["bytes_full too big", { ...dailyUsage, bytes_full: 2 ** 36 }],
+    ["bytes_returned too big", { ...dailyUsage, bytes_returned: 2 ** 36 }],
     ["map count too big", { ...dailyUsage, sessions: 2 ** 24 - 1, harness_sessions: { claude: 2 ** 24 } }],
     ["followed > calls", { ...dailyUsage, calls: 17 }],
     ["failed > runs", { ...dailyUsage, runs_failed: 32 }],
@@ -218,7 +221,9 @@ test("rejects malformed and out-of-contract events", () => {
     ["user blocks > user runs", { ...dailyUsage, blocks_user: 5 }],
     ["first-party blocks > runs", { ...dailyUsage, blocks_first_party: 32 }],
     ["forged: only unbounded-looking fields set", { ...base, event: "daily_usage", day: "2026-10-02", blocks_user: 9, harness_sessions: { claude: 9 } }],
-    ["first-party runs > runs", { ...dailyUsage, runs: 26, runs_user: 0, runs_failed: 0 }],
+    ["first-party runs > runs", { ...dailyUsage, runs: 26, runs_user: 0, blocks_user: 0, runs_failed: 0 }],
+    ["first-party + user runs > runs", { ...dailyUsage, runs_user: 5 }],
+    ["blocks > runs", { ...base, event: "daily_usage", day: "2026-10-02", runs: 3, runs_user: 3, blocks_user: 2, blocks_first_party: 2 }],
     ["first_party_runs not an object", { ...dailyUsage, first_party_runs: [["json-peek", 1]] }],
     ["first_party_runs a string", { ...dailyUsage, first_party_runs: "json-peek" }],
     ["harness_sessions a number", { ...dailyUsage, harness_sessions: 5 }],
@@ -279,8 +284,12 @@ test("accepts honest days that look inconsistent", () => {
   // Unverified blocks get a marker added, so more bytes are returned than printed.
   const wrapped = { ...base, event: "daily_usage", day: "2026-10-02", repos_active: 1, runs: 3, runs_user: 3, blocks_user: 1, bytes_full: 36, bytes_returned: 93 };
   assert.equal(ok(wrapped)!.bytes_returned, 93);
-  // The largest values one row may carry.
-  const edge = ok({ ...dailyUsage, scripts: 2 ** 24 - 1, bytes_full: 2 ** 40 - 1 })!;
+  // One session seen under two harness names; scripts captured with no session id.
+  assert.ok(ok({ ...base, event: "daily_usage", day: "2026-10-02", sessions: 2, harness_sessions: { claude: 2, codex: 2 } }));
+  assert.ok(ok({ ...base, event: "daily_usage", day: "2026-10-02", scripts: 3 }));
+  // The largest values one row may carry, on each side of the byte pair.
+  const edge = ok({ ...dailyUsage, scripts: 2 ** 24 - 1, bytes_full: 2 ** 36 - 1, bytes_returned: 2 ** 36 - 1 })!;
   assert.equal(edge.scripts, 2 ** 24 - 1);
-  assert.equal(edge.bytes_full, 2 ** 40 - 1);
+  assert.equal(edge.bytes_full, 2 ** 36 - 1);
+  assert.equal(edge.bytes_returned, 2 ** 36 - 1);
 });

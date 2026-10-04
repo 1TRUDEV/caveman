@@ -147,14 +147,16 @@ begin
   -- the other transaction waits for that row is a deadlock that aborts a whole
   -- batch and stalls every sender behind the global row. If someone else holds
   -- the lock they are storing this install's day right now: skip ours. Should
-  -- their transaction roll back, the day is lost with it; the client's next
-  -- flush does not resend it.
+  -- their row then not be stored after all (their transaction rolls back, or
+  -- a limit below drops it), the day is lost: the client's next flush does not
+  -- resend it. The key is two integers, not text, so it cannot depend on a
+  -- session's DateStyle.
   --
   -- Accepted: whoever knows an install id can store that install's day first
   -- (an all-zero row) and so suppress the real one. The id is a random UUID
   -- shown only to its owner; there is no cheaper fix without authentication.
   if new.event = 'daily_usage' then
-    if not pg_try_advisory_xact_lock(hashtextextended(new.anonymous_id::text || new.day::text, 0)) then
+    if not pg_try_advisory_xact_lock(hashtext(new.anonymous_id::text), new.day - date '2000-01-01') then
       return null;
     end if;
     if exists (

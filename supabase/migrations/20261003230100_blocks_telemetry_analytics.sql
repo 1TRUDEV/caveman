@@ -88,21 +88,38 @@ with u as (
     count(*) filter (where linked) as linked_users
   from analytics.blocks_users
 ),
+per_install as (
+  select
+    sum(sessions) as sessions,
+    sum(hints) as hints,
+    sum(hints_followed) as hints_followed,
+    sum(runs) as runs,
+    sum(greatest(bytes_full - bytes_returned, 0)) as bytes_withheld
+  from public.blocks_events
+  where event = 'daily_usage' and day > (now() at time zone 'utc')::date - 30
+  group by anonymous_id
+),
 usage as (
   select
     coalesce(sum(sessions), 0) as sessions_30d,
     coalesce(sum(hints), 0) as hints_30d,
     coalesce(sum(hints_followed), 0) as hints_followed_30d,
     coalesce(sum(runs), 0) as runs_30d,
-    coalesce(sum(greatest(bytes_full - bytes_returned, 0)), 0) as bytes_withheld_30d
-  from public.blocks_events
-  where event = 'daily_usage' and day > (now() at time zone 'utc')::date - 30
+    coalesce(sum(bytes_withheld), 0) as bytes_withheld_30d,
+    -- An install never counts more follows than hints here, so one forged
+    -- row (the endpoint is unauthenticated) cannot push the rate past 100.
+    coalesce(sum(least(hints_followed, hints)), 0) as followed_capped
+  from per_install
 )
 select
   u.*,
-  usage.*,
+  usage.sessions_30d,
+  usage.hints_30d,
+  usage.hints_followed_30d,
+  usage.runs_30d,
+  usage.bytes_withheld_30d,
   -- share of counted hints followed by a call of the hinted block
-  round(100.0 * usage.hints_followed_30d / nullif(usage.hints_30d, 0), 1) as hint_follow_pct_30d
+  round(100.0 * usage.followed_capped / nullif(usage.hints_30d, 0), 1) as hint_follow_pct_30d
 from u, usage;
 
 create view analytics.blocks_daily with (security_invoker = true) as

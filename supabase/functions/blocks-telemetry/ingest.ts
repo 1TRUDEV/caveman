@@ -18,7 +18,7 @@ const MAX_COUNT = 2 ** 32;
 // One install's day: a hook event every second is 86,400. The endpoint is
 // unauthenticated, so these bound what one forged row can add to a sum.
 const MAX_DAILY = 2 ** 24;
-const MAX_BYTES = 2 ** 40;
+const MAX_BYTES = 2 ** 36;
 const DAY_MS = 86_400_000;
 const EVENTS = new Set(["first_run", "command_run", "daily_usage"]);
 // Go's GOOS and GOARCH values.
@@ -205,9 +205,12 @@ function toRow(raw: Raw, now: Date): Row {
     // its call, so hints_followed can exceed that day's hints; and the runner's
     // wrapper (the unverified mark, the truncation envelope) can make the bytes
     // returned exceed the bytes a block printed.
+    // A run is first-party or not, and a block that ran has at least one run.
+    // The sum over harnesses is not tied to sessions: one session can be seen
+    // under two harness names.
     check(validDay(day, now) && usage.hints_followed <= usage.calls
-      && usage.runs_failed <= usage.runs && usage.runs_user <= usage.runs && firstPartyTotal <= usage.runs
-      && usage.blocks_first_party <= usage.runs && usage.blocks_user <= usage.runs_user
+      && usage.runs_failed <= usage.runs && usage.runs_user + firstPartyTotal <= usage.runs
+      && usage.blocks_first_party + usage.blocks_user <= usage.runs && usage.blocks_user <= usage.runs_user
       && Object.values(harnessSessions).every((n) => n <= usage.sessions));
   } else {
     // The raw maps: a foreign map with only unknown keys is still set.
