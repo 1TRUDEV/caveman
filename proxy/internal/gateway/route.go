@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/JuliusBrussee/caveman/proxy/providers"
 	"github.com/JuliusBrussee/caveman/proxy/providers/jsonsplice"
 )
 
@@ -37,9 +38,26 @@ type RouteAnswer struct {
 	Outcome    string
 	Reason     string
 	DecisionID string
-	// Reject, when set, tells the link the provider refused the routed model,
-	// so the rest of this ask stays on the asked one.
-	Reject func()
+	// Reject, when set, moves the rest of this ask back to the asked model.
+	// refused says the provider refused the routed model (the original bytes
+	// then succeeded), which the link also remembers for the session and model
+	// pair; false is any other failure on the routed model (5xx, transport
+	// error, a broken stream).
+	Reject func(refused bool)
+}
+
+func (a RouteAnswer) reject(refused bool) {
+	if a.Reject != nil {
+		a.Reject(refused)
+	}
+}
+
+// routedAttemptFailed: the routed model answered 5xx, or its answer broke off
+// (stream error, provider error event, cancel) before the provider reported
+// usage. A 4xx is the replay's to judge, and a cancel after a complete answer
+// is no failure: Codex closes its stream on response.completed.
+func routedAttemptFailed(status int, broken bool, usage providers.UsageObservation) bool {
+	return status >= 500 || status < 400 && broken && !usage.Complete()
 }
 
 // CloudLink is the optional signed-in Cloud connection: the route stage asks

@@ -461,6 +461,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.doUpstream(r.Context(), buildUpstream(transform.Body, upstreamHeaders))
 	s.inflight.Add(-1)
 	if err != nil {
+		if meta.Model != modelRequested {
+			evidence.route.reject(false) // the agent's own retry goes to the asked model
+		}
 		httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unavailable", "Upstream provider unavailable.")
 		estimateWG.Wait() // join the observe estimate before record() reads it
 		s.record(start, 0, requestID, traceID, rc, meta, authMode, http.StatusBadGateway, 0, len(body), rawHash, transformedHash, "cave_upstream_unavailable", transform.OptimizerIDs, providers.UsageObservation{CacheStatus: "unknown"}, comp, toolSchemaHandle, false, estimate, evidence, providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown, cacheBust, compressionEligible)
@@ -472,7 +475,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	// (Measured 2026-07-07: Anthropic answers subscription-OAuth requests whose
 	// first system block changed with an opaque 429; any future fingerprint check
 	// lands here too.) The retry claims no optimization and books no savings.
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 && !bytes.Equal(transform.Body, body) {
+	// A 401/403 is about the credential, not the bytes: no replay.
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized &&
+		resp.StatusCode != http.StatusForbidden && !bytes.Equal(transform.Body, body) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 		if s.logger != nil {
@@ -488,6 +493,15 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			retryHeaders.Set("user-agent", r.UserAgent())
 		}
 		s.applyUpstreamAuthFallback(adapter.Name(), credential, retryHeaders)
+		routedAnswer := evidence.route
+		if meta.Model != modelRequested {
+			// The original bytes go to the asked model. Only their success
+			// proves the routed model was refused; a replay that fails too (an
+			// account rate limit) blames nothing.
+			meta.Model = modelRequested
+			w.Header().Del("x-caveman-routed-from")
+			evidence.route = RouteAnswer{Outcome: "degraded", Reason: "replay_failed"}
+		}
 		s.inflight.Add(1)
 		retryResp, derr := s.doUpstream(r.Context(), buildUpstream(body, retryHeaders))
 		s.inflight.Add(-1)
@@ -500,12 +514,8 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = retryResp
 		upstreamHeaders = retryHeaders
-		if meta.Model != modelRequested {
-			meta.Model = modelRequested
-			w.Header().Del("x-caveman-routed-from")
-			if evidence.route.Reject != nil {
-				evidence.route.Reject() // the rest of this ask stays on the asked model
-			}
+		if routedAnswer.Outcome == "routed" && resp.StatusCode < 400 {
+			routedAnswer.reject(true)
 			evidence.route = RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
 		}
 		transform = providers.TransformResult{Body: body, OptimizerIDs: []string{}}
@@ -565,6 +575,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	if !meta.Stream {
 		data, rerr := readUpstreamBody(resp)
 		if rerr != nil {
+			if meta.Model != modelRequested {
+				evidence.route.reject(false)
+			}
 			httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_body_read_failed", "Upstream response could not be read completely.")
 			estimateWG.Wait()
 			s.record(start, 0, requestID, traceID, rc, meta, authMode, http.StatusBadGateway, 0, len(body), rawHash, transformedHash, "cave_upstream_body_read_failed", transform.OptimizerIDs, providers.UsageObservation{CacheStatus: "unknown"}, comp, toolSchemaHandle, false, estimate, evidence, providerCachePrefixSHA256, providerCacheComponentSHA256, cacheBoundaryKnown, cacheBust, compressionEligible)
@@ -632,6 +645,9 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		if meta.Stream {
 			errCode = "provider_stream_error"
 		}
+	}
+	if meta.Model != modelRequested && routedAttemptFailed(resp.StatusCode, errCode != "", finalUsage) {
+		evidence.route.reject(false) // the agent's own retry goes to the asked model
 	}
 	// The session ledger sees the provider's own numbers for the upstream call the
 	// levers actually shaped — not the retrieve-loop total below, whose extra calls

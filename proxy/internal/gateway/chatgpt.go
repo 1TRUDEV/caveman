@@ -203,6 +203,9 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 		resp, err = s.httpClient.Do(upReq)
 	}
 	if err != nil {
+		if route.Outcome == "routed" {
+			route.reject(false) // the agent's own retry goes to the asked model
+		}
 		httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unreachable", "ChatGPT upstream is unreachable.")
 		requestHashComplete := chatGPTRequestHashComplete(requestBodyFullyRead, r.ContentLength, reqCapture, requestBodyTracker)
 		s.recordChatGPT(rc, r, requestID, traceID, suffix, start, 0, "cave_upstream_unreachable", reqCapture, reqHash.Sum(nil), transformedChatGPTHash(reqHash.Sum(nil), transform.Body), requestHashComplete, nil, 0, false, transform.OptimizerIDs, comp, compressEligible, transform.Body, route)
@@ -210,15 +213,17 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 	}
 	// OAuth backends can reject byte-modified requests for undocumented reasons.
 	// Retry once with exact original bytes, then disclose/record no optimization.
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 && bodyChanged {
+	// A 401/403 is about the credential, not the bytes: no replay.
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized &&
+		resp.StatusCode != http.StatusForbidden && bodyChanged {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
+		routedAnswer := route
 		if route.Outcome == "routed" {
+			// Only the original bytes' success proves the routed model was
+			// refused; a replay that fails too (an account rate limit) blames nothing.
 			w.Header().Del("x-caveman-routed-from")
-			if route.Reject != nil {
-				route.Reject() // the rest of this ask stays on the asked model
-			}
-			route = RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
+			route = RouteAnswer{Outcome: "degraded", Reason: "replay_failed"}
 		}
 		retryResp, doErr := s.doUpstream(r.Context(), func() (*http.Request, error) {
 			retryReq, retryErr := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(originalBody))
@@ -235,6 +240,10 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp = retryResp
+		if routedAnswer.Outcome == "routed" && resp.StatusCode < 400 {
+			routedAnswer.reject(true)
+			route = RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
+		}
 		transform = providers.TransformResult{Body: originalBody, OptimizerIDs: []string{}}
 		comp = nil
 		// The original bytes served the request; the capture written before
@@ -266,6 +275,15 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 	stream := streamingResponse(resp.Header)
 	counter, errCode := s.streamResponse(w, r, io.TeeReader(resp.Body, respCapture), stream, requestID)
 	respBytes := counter.n
+	if route.Outcome == "routed" {
+		var usage providers.UsageObservation
+		if !respCapture.truncated {
+			providers.ParseUsageBytes("openai", respCapture.buf.Bytes(), &usage)
+		}
+		if routedAttemptFailed(resp.StatusCode, errCode != "" || usage.ProviderError, usage) {
+			route.reject(false) // the agent's own retry goes to the asked model
+		}
+	}
 
 	// The streaming path forwarded the request without ever holding it whole, so it
 	// captures only what it can state truthfully: the whole body's length and hash,
@@ -319,7 +337,9 @@ func (s *Server) recordChatGPT(rc RequestContext, r *http.Request, requestID, tr
 	if respCapture != nil && !respCapture.truncated {
 		providers.ParseUsageBytes("openai", respCapture.buf.Bytes(), &usage)
 	}
-	model := "unknown"
+	// Empty when unread (over the capture limit, or not JSON): Cloud never gets
+	// "unknown" as a model id; the local row still says unknown.
+	model := ""
 	if reqCapture != nil && !reqCapture.truncated {
 		var body struct {
 			Model string `json:"model"`
@@ -360,13 +380,13 @@ func (s *Server) recordChatGPT(rc RequestContext, r *http.Request, requestID, tr
 		Label:                    labelOrDefault(rc.Label, "local"),
 		AgentSlug:                rc.AgentSlug,
 		Provider:                 "chatgpt-subscription",
-		Model:                    model,
+		Model:                    labelOrDefault(model, "unknown"),
 		RouteFrom:                modelRequested,
 		RouteTo:                  model,
 		RouteOutcome:             route.Outcome,
 		RouteReason:              route.Reason,
 		RouteDecisionID:          route.DecisionID,
-		ProviderOriginKnown:      s.chatGPTUpstream == DefaultChatGPTUpstream,
+		ProviderOriginKnown:      s.chatGPTUpstream == DefaultChatGPTUpstream && model != "",
 		Endpoint:                 endpoint,
 		Stream:                   stream,
 		StatusCode:               status,
@@ -399,7 +419,7 @@ func (s *Server) recordChatGPT(rc RequestContext, r *http.Request, requestID, tr
 		RecoveryHandle:             compHandle,
 	}
 	var originalBody []byte
-	meta := providers.RequestMetadata{Provider: "chatgpt-subscription", Model: model}
+	meta := providers.RequestMetadata{Provider: "chatgpt-subscription", Model: row.Model}
 	if requestHashComplete && reqCapture != nil && !reqCapture.truncated {
 		originalBody = reqCapture.buf.Bytes()
 		if inspected, err := openai.New("").InspectRequest(r.Context(), bytes.NewReader(originalBody), r.Header); err == nil {
@@ -418,6 +438,9 @@ func (s *Server) recordChatGPT(rc RequestContext, r *http.Request, requestID, tr
 	}
 	requestAccounting(&row, meta, usage, originalBody, acceptedBody, false)
 	s.sink.Record(row)
+	if s.cloud != nil {
+		s.cloud.Observe(row)
+	}
 }
 
 type eofTrackingReader struct {

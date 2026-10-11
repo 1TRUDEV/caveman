@@ -627,9 +627,43 @@ func TestRejectedModelKeepsTheAskOnTheAskedModel(t *testing.T) {
 	if first.Model != "claude-sonnet-5-5" || first.Reject == nil {
 		t.Fatalf("first = %+v", first)
 	}
-	first.Reject()
+	first.Reject(true)
 	if next := link.Ask(t.Context(), messagesAsk("claude-opus-5-5"))(); next.Model != "" || next.Reason != "provider_rejected_routed_model" || hits.Load() != 1 {
 		t.Fatalf("next = %+v, cloud hits %d", next, hits.Load())
+	}
+}
+
+// A refusal holds for the session's asked/routed pair on later asks for
+// refusedFor; any other failure moves only the one ask back.
+func TestRefusalHoldsForTheSessionsModelPair(t *testing.T) {
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	link := newLink(cloudHome(t, cloud.URL, true, `{"access_token":"`+token(time.Now().Add(time.Hour))+`"}`))
+	link.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	ask := func(session, text string) gateway.RouteAnswer {
+		next := messagesAsk("claude-opus-5-5")
+		next.SessionID = session
+		next.Body = []byte(strings.Replace(string(next.Body), secretPrompt, text, 1))
+		return link.Ask(t.Context(), next)()
+	}
+	ask("s1", "first").Reject(false)
+	if next := ask("s1", "second"); next.Model != "claude-sonnet-5-5" {
+		t.Fatalf("a failure, not a refusal, held past its ask: %+v", next)
+	}
+	ask("s1", "third").Reject(true)
+	if next := ask("s1", "fourth"); next.Model != "" || next.Reason != "provider_rejected_routed_model" {
+		t.Fatalf("the refusal did not hold for the pair: %+v", next)
+	}
+	if other := ask("s2", "fourth"); other.Model != "claude-sonnet-5-5" {
+		t.Fatalf("another session inherited the refusal: %+v", other)
+	}
+	clock.Add(int64(refusedFor))
+	if later := ask("s1", "fifth"); later.Model != "claude-sonnet-5-5" {
+		t.Fatalf("the refusal outlived refusedFor: %+v", later)
 	}
 }
 

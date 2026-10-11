@@ -732,37 +732,47 @@ func TestChatGPTRouteStageSwapsTheModelUpstream(t *testing.T) {
 	if row.TotalCostUSD != 0 || row.SavingsUSD != 0 || row.RequestMeasurementStatus != "measured" || row.RequestTokensBefore != row.RequestTokensAfter {
 		t.Errorf("routed subscription row claims a saving: %+v", row)
 	}
-}
-
-// A backend that refuses the routed model gets the exact original bytes, and the
-// row records the asked model with a degraded route, never "routed".
-func TestChatGPTRouteStageRejectedModelRetriesOriginalBytes(t *testing.T) {
-	rejected := 0
-	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed", Reject: func() { rejected++ }}}
-	rt := &captureTransport{statuses: []int{http.StatusBadRequest, http.StatusOK}}
-	sink := &captureSink{}
-	rec := sendChatGPT(chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream), nil)
-	if rec.Code != http.StatusOK || len(rt.bodies) != 2 {
-		t.Fatalf("status/calls = %d/%d, want 200/2", rec.Code, len(rt.bodies))
+	if row.PricingModel != "gpt-6-sol" {
+		t.Errorf("API-equivalent priced on %q, not the model that served", row.PricingModel)
 	}
-	if !bytes.Equal(rt.bodies[1], []byte(chatGPTRouteBody)) {
-		t.Fatalf("retry must use exact original bytes:\n got %s\nwant %s", rt.bodies[1], chatGPTRouteBody)
-	}
-	if rejected != 1 || rec.Header().Get("x-caveman-routed-from") != "" {
-		t.Errorf("Reject called %d times, routed-from %q", rejected, rec.Header().Get("x-caveman-routed-from"))
-	}
-	row := sink.last(t)
-	if row.Model != "gpt-6.1-sol" || row.RouteTo != "gpt-6.1-sol" || row.RouteOutcome != "degraded" || row.RouteReason != "provider_rejected_routed_model" {
-		t.Errorf("row model %q to %q outcome %q reason %q", row.Model, row.RouteTo, row.RouteOutcome, row.RouteReason)
+	if len(cloud.observed) != 1 || cloud.observed[0].Model != "gpt-6-sol" || cloud.observed[0].RouteFrom != "gpt-6.1-sol" {
+		t.Errorf("Cloud saw %d rows: %+v", len(cloud.observed), cloud.observed)
 	}
 }
 
-// The request-wide opt-out and a non-default backend never ask.
-func TestChatGPTRouteStageSkipsPassThroughAndCustomOrigin(t *testing.T) {
+// routedFailures (route_test.go) on the ChatGPT route: the replay is the
+// exact original bytes, and a row naming the asked model drops routed-from.
+func TestChatGPTRouteStageFailuresOnTheRoutedModel(t *testing.T) {
+	for _, tc := range routedFailures {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+			rt, transport := failingUpstream(tc.statuses, `{"id":"resp","usage":{"input_tokens":90,"output_tokens":10}}`)
+			sink := &captureSink{}
+			rec := sendChatGPT(chatGPTRouteServer(cloud, transport, sink, DefaultChatGPTUpstream), nil)
+			row := sink.last(t)
+			if rec.Code != tc.code || len(rt.bodies) != tc.calls || fmt.Sprint(cloud.rejects) != tc.rejects ||
+				row.RouteOutcome != tc.outcome || row.RouteReason != tc.reason || (row.Model == "gpt-6.1-sol") != tc.asked {
+				t.Fatalf("code %d calls %d rejects %v outcome %q reason %q model %q", rec.Code, len(rt.bodies), cloud.rejects, row.RouteOutcome, row.RouteReason, row.Model)
+			}
+			if tc.calls == 2 && !bytes.Equal(rt.bodies[1], []byte(chatGPTRouteBody)) {
+				t.Fatalf("replay was not the original bytes: %s", rt.bodies[1])
+			}
+			if tc.asked && rec.Header().Get("x-caveman-routed-from") != "" {
+				t.Errorf("routed-from survived the replay on the asked model")
+			}
+		})
+	}
+}
+
+// The request-wide opt-out, an encoded body and a non-default backend never ask.
+// The encoded request carries plain JSON on purpose: only the header keeps it
+// from being read and routed.
+func TestChatGPTRouteStageSkipsOptOutsAndCustomOrigin(t *testing.T) {
 	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
 	rt := &captureTransport{}
 	sink := &captureSink{}
 	sendChatGPT(chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream), map[string]string{"x-cave-transforms": "caveman.pass-through.v1"})
+	sendChatGPT(chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream), map[string]string{"Content-Encoding": "zstd"})
 	sendChatGPT(chatGPTRouteServer(cloud, rt, sink, "https://chatgpt.test/backend-api/codex"), nil)
 	if len(cloud.asks) != 0 {
 		t.Fatalf("asks = %d, want none", len(cloud.asks))
@@ -772,7 +782,80 @@ func TestChatGPTRouteStageSkipsPassThroughAndCustomOrigin(t *testing.T) {
 			t.Fatalf("upstream body changed: %s", body)
 		}
 	}
-	if len(sink.rows) != 2 || sink.rows[0].RouteOutcome != "" || sink.rows[1].RouteReason != "custom_provider_origin" {
-		t.Errorf("rows %d, outcome %q / reason %q", len(sink.rows), sink.rows[0].RouteOutcome, sink.rows[1].RouteReason)
+	if len(sink.rows) != 3 || sink.rows[0].RouteOutcome != "" || sink.rows[1].RouteOutcome != "" || sink.rows[2].RouteReason != "custom_provider_origin" {
+		t.Errorf("rows %d, outcomes %q / %q / reason %q", len(sink.rows), sink.rows[0].RouteOutcome, sink.rows[1].RouteOutcome, sink.rows[2].RouteReason)
+	}
+}
+
+// compressRouteServer is an entitled compress-mode ChatGPT route that also routes.
+func compressRouteServer(cloud CloudLink, rt http.RoundTripper, sink TelemetrySink) *Server {
+	return New(Config{
+		Auth: stubAuth{rc: RequestContext{Label: "local", RuntimeMode: "compress"}}, Sink: sink,
+		Compressor: &liveZoneCompressor{}, PrefixCache: newTestPrefixCache(), RecoveryViaMCP: true,
+		ChatGPTUpstream: DefaultChatGPTUpstream, HTTPClient: &http.Client{Transport: rt}, Cloud: cloud,
+	})
+}
+
+func compressibleChatGPTBody() string {
+	live := strings.Repeat("codex oauth live tool output ", 40)
+	return `{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + live + `"}]}]}`
+}
+
+// Compressed and routed at once: both reach the backend, and the routing guard
+// in requestAccounting still lets the compression delta through.
+func TestChatGPTRouteStageCompressedAndRouted(t *testing.T) {
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+	rt := &captureTransport{responses: []string{`{"id":"resp","usage":{"input_tokens":90,"output_tokens":10}}`}}
+	sink := &captureSink{}
+	req := httptest.NewRequest(http.MethodPost, "/chatgpt/responses", strings.NewReader(compressibleChatGPTBody()))
+	req.Header.Set("Authorization", "Bearer codex-oauth-secret")
+	rec := httptest.NewRecorder()
+	compressRouteServer(cloud, rt, sink).Handler().ServeHTTP(rec, req)
+	up := string(rt.bodies[0])
+	if rec.Code != http.StatusOK || len(rt.bodies) != 1 || !strings.Contains(up, `"gpt-6-sol"`) || !strings.Contains(up, "<<ccr:") {
+		t.Fatalf("status %d, upstream not compressed and routed: %s", rec.Code, up)
+	}
+	row := sink.last(t)
+	if row.Model != "gpt-6-sol" || row.RouteOutcome != "routed" || row.RecoveryHandle == "" || row.RequestTokensBefore <= row.RequestTokensAfter {
+		t.Fatalf("row model %q outcome %q handle %q tokens %d->%d", row.Model, row.RouteOutcome, row.RecoveryHandle, row.RequestTokensBefore, row.RequestTokensAfter)
+	}
+}
+
+// Compressed and routed, refused: one replay of the exact original bytes, and
+// the row claims neither the route nor the compression.
+func TestChatGPTRouteStageCompressedAndRoutedRefused(t *testing.T) {
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+	rt := &captureTransport{statuses: []int{http.StatusBadRequest, http.StatusOK}}
+	sink := &captureSink{}
+	body := compressibleChatGPTBody()
+	req := httptest.NewRequest(http.MethodPost, "/chatgpt/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer codex-oauth-secret")
+	rec := httptest.NewRecorder()
+	compressRouteServer(cloud, rt, sink).Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(rt.bodies) != 2 || !bytes.Equal(rt.bodies[1], []byte(body)) {
+		t.Fatalf("status/calls %d/%d, replay exact %v", rec.Code, len(rt.bodies), len(rt.bodies) == 2 && bytes.Equal(rt.bodies[1], []byte(body)))
+	}
+	row := sink.last(t)
+	if fmt.Sprint(cloud.rejects) != "[true]" || rec.Header().Get("x-caveman-recovery-handle") != "" ||
+		row.Model != "gpt-6.1-sol" || row.RouteOutcome != "degraded" || row.CompressionTokensBefore != 0 || row.RecoveryHandle != "" {
+		t.Fatalf("rejects %v handle %q row model %q outcome %q comp %d", cloud.rejects, rec.Header().Get("x-caveman-recovery-handle"), row.Model, row.RouteOutcome, row.CompressionTokensBefore)
+	}
+}
+
+// A body over the capture limit streams through byte-exact, is never asked
+// about, and its row names no model to Cloud.
+func TestChatGPTRouteStageOverCapturedLimit(t *testing.T) {
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+	rt := &captureTransport{}
+	sink := &captureSink{}
+	big := `{"model":"gpt-6.1-sol","input":"` + strings.Repeat("a", chatGPTCaptureLimit) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/chatgpt/responses", strings.NewReader(big))
+	rec := httptest.NewRecorder()
+	chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream).Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(rt.bodies) != 1 || !bytes.Equal(rt.bodies[0], []byte(big)) || len(cloud.asks) != 0 {
+		t.Fatalf("status %d calls %d asks %d", rec.Code, len(rt.bodies), len(cloud.asks))
+	}
+	if row := cloud.observed[0]; row.Model != "unknown" || row.RouteFrom != "" || row.RouteTo != "" || row.ProviderOriginKnown {
+		t.Fatalf("row model %q from %q to %q origin known %v", row.Model, row.RouteFrom, row.RouteTo, row.ProviderOriginKnown)
 	}
 }

@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,18 +34,35 @@ func TestSetModelSwapsOnlyTheTopLevelModel(t *testing.T) {
 	}
 }
 
+// fakeCloud decides on its own goroutine, reading the body while the handler
+// compresses, as cloudlink.Link does, so -race sees the overlap. rejects
+// records each Reject call's refused flag.
 type fakeCloud struct {
 	mu       sync.Mutex
 	answer   RouteAnswer
 	asks     []RouteAsk
 	observed []RequestRecord
+	rejects  []bool
 }
 
 func (f *fakeCloud) Ask(_ context.Context, ask RouteAsk) func() RouteAnswer {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.asks = append(f.asks, ask)
-	return func() RouteAnswer { return f.answer }
+	answer := f.answer
+	f.mu.Unlock()
+	done := make(chan RouteAnswer, 1)
+	go func() {
+		_ = LatestHumanText(ask.Provider, ask.Endpoint, ask.Body)
+		if answer.Model != "" {
+			answer.Reject = func(refused bool) {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				f.rejects = append(f.rejects, refused)
+			}
+		}
+		done <- answer
+	}()
+	return func() RouteAnswer { return <-done }
 }
 
 func (f *fakeCloud) Observe(rec RequestRecord) {
@@ -235,13 +254,83 @@ func TestRouteStageSkipsCustomOrigins(t *testing.T) {
 	}
 }
 
-// The provider refusing the routed model tells the link, once.
-func TestRouteStageReportsARejectedModel(t *testing.T) {
-	rejected := 0
-	cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed", Reject: func() { rejected++ }}}
-	srv, _ := routeServer(t, cloud, "claude-sonnet-5-5")
-	sendMessages(t, srv, nil)
-	if rejected != 1 {
-		t.Fatalf("Reject called %d times, want once", rejected)
+// routedFailures is what an upstream does to a routed request and what must
+// follow, on either path. Only a refusal the original bytes then get past
+// blames the routed model (Reject(true)); a replay that fails too blames
+// nothing; a 401/403 is never replayed; a 5xx or transport error moves the ask
+// back without a replay (Reject(false)).
+var routedFailures = []struct {
+	name     string
+	statuses []int // per attempt; nil is a transport error
+	calls    int
+	rejects  string // fmt of the Reject flags
+	code     int
+	outcome  string
+	reason   string
+	asked    bool // the row names the asked model
+}{
+	{"refused, then served", []int{400, 200}, 2, "[true]", 200, "degraded", "provider_rejected_routed_model", true},
+	{"replay fails too", []int{429, 429}, 2, "[]", 429, "degraded", "replay_failed", true},
+	{"auth failure", []int{401}, 1, "[]", 401, "routed", "", false},
+	{"server error", []int{503}, 1, "[false]", 503, "routed", "", false},
+	{"transport error", nil, 1, "[false]", 502, "routed", "", false},
+}
+
+// failingUpstream answers each attempt with the next status, or fails the
+// transport when statuses is nil.
+func failingUpstream(statuses []int, body string) (*captureTransport, http.RoundTripper) {
+	rt := &captureTransport{statuses: statuses, responses: []string{body, body}}
+	if statuses != nil {
+		return rt, rt
+	}
+	return rt, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		_, _ = rt.RoundTrip(r)
+		return nil, errors.New("connection reset")
+	})
+}
+
+func TestRouteStageFailuresOnTheRoutedModel(t *testing.T) {
+	for _, tc := range routedFailures {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
+			srv, _ := routeServer(t, cloud, "")
+			rt, transport := failingUpstream(tc.statuses, `{"id":"m","type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":2}}`)
+			srv.httpClient = &http.Client{Transport: transport}
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-opus-5-5","max_tokens":5,"messages":[{"role":"user","content":"fix the bug"}]}`))
+			req.Header.Set("authorization", "Bearer sk-ant-oat01-subscription")
+			req.Header.Set("user-agent", "claude-cli/2.1.0")
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			row := cloud.observed[0]
+			if rec.Code != tc.code || len(rt.bodies) != tc.calls || fmt.Sprint(cloud.rejects) != tc.rejects ||
+				row.RouteOutcome != tc.outcome || row.RouteReason != tc.reason || (row.Model == "claude-opus-5-5") != tc.asked {
+				t.Fatalf("code %d calls %d rejects %v outcome %q reason %q model %q", rec.Code, len(rt.bodies), cloud.rejects, row.RouteOutcome, row.RouteReason, row.Model)
+			}
+			if tc.calls == 2 && string(rt.bodies[1]) != `{"model":"claude-opus-5-5","max_tokens":5,"messages":[{"role":"user","content":"fix the bug"}]}` {
+				t.Fatalf("replay was not the original bytes: %s", rt.bodies[1])
+			}
+		})
+	}
+}
+
+// On the subscription path the routed request differs from the agent's only
+// in the model, in every runtime mode.
+func TestRouteStageSubscriptionChangesOnlyTheModel(t *testing.T) {
+	asked := `{"model":"claude-opus-5-5","max_tokens":5,  "system":[{"type":"text","text":"You are Claude Code"}],"messages":[{"role":"user","content":"fix the bug é"}]}`
+	want := strings.Replace(asked, `"claude-opus-5-5"`, `"claude-sonnet-5-5"`, 1)
+	for _, mode := range []string{"record", "compress", "pixel", "observe"} {
+		cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
+		srv, _ := routeServer(t, cloud, "")
+		rt := &captureTransport{responses: []string{`{"id":"m","type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":2}}`}}
+		srv.httpClient = &http.Client{Transport: rt}
+		srv.compressor = &liveZoneCompressor{}
+		srv.auth = stubAuth{rc: RequestContext{Label: "local", RuntimeMode: mode}}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(asked))
+		req.Header.Set("authorization", "Bearer sk-ant-oat01-subscription")
+		req.Header.Set("user-agent", "claude-cli/2.1.0")
+		srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
+		if len(rt.bodies) != 1 || string(rt.bodies[0]) != want {
+			t.Errorf("%s: upstream body differs beyond the model:\n got %s\nwant %s", mode, rt.bodies, want)
+		}
 	}
 }

@@ -46,6 +46,7 @@ const (
 	pauseRecheck = 15 * time.Minute // how often a limit pause asks /me whether it still holds
 	refusedPause = 10 * time.Minute // after a 401/403: a stale or revoked login
 	decisionsMax = 1024
+	refusedFor   = 30 * time.Minute // how long a provider's refusal of a routed model holds
 	answerMax    = 1 << 20
 )
 
@@ -74,6 +75,7 @@ type Link struct {
 	stale      bool // a background keychain read found a new secret
 	cfg        settings
 	decisions  map[string]*decision
+	refused    map[string]time.Time // session, provider, asked and routed model: when the provider refused it
 	pauseUntil time.Time
 	paused     gateway.RouteAnswer // what an ask answers while paused
 	recheckAt  time.Time           // the last /me check of a limit pause
@@ -431,14 +433,33 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 	answer := d.answer
 	if answer.Model != "" {
 		k := string(key[:])
-		answer.Reject = func() {
-			// The provider refused the routed model: the rest of this ask keeps
-			// the asked one instead of failing over on every turn.
+		pair := ask.SessionID + "\x00" + ask.Provider + "\x00" + ask.Model + "\x00" + answer.Model
+		l.mu.Lock()
+		at, refused := l.refused[pair]
+		l.mu.Unlock()
+		if refused && l.now().Sub(at) < refusedFor {
+			// A field only the asked model accepts would be refused again: skip
+			// the wasted round trip and the replay.
+			return gateway.RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
+		}
+		answer.Reject = func(refusedByProvider bool) {
+			// The rest of this ask keeps the asked model instead of failing over
+			// on every turn; a refusal also holds for the session's model pair.
+			reason := "routed_model_failed"
+			if refusedByProvider {
+				reason = "provider_rejected_routed_model"
+			}
 			done := make(chan struct{})
 			close(done)
 			l.mu.Lock()
 			if l.decisions != nil {
-				l.decisions[k] = &decision{done: done, answer: gateway.RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}}
+				l.decisions[k] = &decision{done: done, answer: gateway.RouteAnswer{Outcome: "degraded", Reason: reason}}
+			}
+			if refusedByProvider {
+				if l.refused == nil || len(l.refused) >= decisionsMax {
+					l.refused = map[string]time.Time{} // ponytail: drop all when full, like decisions
+				}
+				l.refused[pair] = l.now()
 			}
 			l.mu.Unlock()
 		}

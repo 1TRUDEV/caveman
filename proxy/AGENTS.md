@@ -95,16 +95,21 @@ the managed gateway (the managed gateway imports them from here). `caveman start
 - **pixel mode**: S4 lossy text→PNG (`pxpipe` port). Default allowlist is `claude-fable-5,gpt-5.6` via `CAVE_PIXEL_MODELS`; original request is always in CCR before transformed bytes are sent; savings stay inferred-only; any error is byte-identical pass-through.
 - **route stage is optional and fails open** (`internal/cloudlink`, `internal/gateway/route.go`):
   it asks Cloud `POST /v1/route` only while the CLI is signed in with `modules.routing: true` in
-  `$CAVEMAN_HOME/cloud.json`, for API-key Anthropic Messages / OpenAI chat or responses requests
-  whose model is in the same-provider pool (subscription traffic never routes, ADR 0083 §7). The
+  `$CAVEMAN_HOME/cloud.json`, for Anthropic Messages / OpenAI chat or responses requests on an
+  API key, a subscription or an OAuth login, and for Codex ChatGPT-login turns on the `/chatgpt`
+  route (openai pool), whose model is in the same-provider pool (Cloud ADR 0110; subscription rows
+  stay tokens-only, and a routed model swap never counts as a compression saving). The
   ask starts before compression (parse, ask, compress, route), waits at most 800 ms, carries only
   the caller's models and counts (contracts `route-ask-v1`: no `text`, never prompt text), and
   its answer is cached per ask so a tool loop
   never switches model mid-turn. A Cloud error, timeout, 401/403, `allowance` or `billing_limit`
   answer keeps the asked model and pauses new asks (1 min; 10 min for 401/403 and billing_limit;
   until the 1st for allowance). Refusals and limits land in `$CAVEMAN_HOME/route-state.json`
-  (with Cloud's notice) for `caveman status`; a new login lifts the pause. A provider 4xx on the
-  routed model replays the original bytes on the asked model. The pass-through header and encoded bodies
+  (with Cloud's notice) for `caveman status`; a new login lifts the pause. A provider 4xx (never
+  401/403) on a changed body replays the original bytes once on the asked model; only a replay
+  that succeeds blames the routed model (`Reject(true)`: the session's asked/routed pair then stays
+  on the asked model for 30 min), and one that fails too records `replay_failed`. A 5xx, transport
+  error or answer that breaks off before usage moves just that ask back (`Reject(false)`). The pass-through header and encoded bodies
   never route, nor does any origin but the provider's own API (Azure, OpenRouter, LiteLLM, a
   custom base URL); record mode does (routing is its own module). A limit pause asks `/me` at
   most every 15 min and lifts once routing is no longer limited or the plan changed. runtime/v1
