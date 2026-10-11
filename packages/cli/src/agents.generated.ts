@@ -474,10 +474,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "X-Cave-Agent"
     },
-    "tested_agent_version": "1.18.35",
+    "tested_agent_version": "1.19.0",
     "injection_completeness": "declarative",
-    "last_verified_at": "2026-10-07",
-    "verified_by": "local pinned-binary probe (opencode 1.18.35 on Node 22.22.0, agents/probe-installed.mjs); route probe: the OPENCODE_CONFIG_CONTENT overlay loaded and POST /v1/responses reached the injected baseURL carrying X-Cave-Agent: opencode",
+    "last_verified_at": "2026-10-11",
+    "verified_by": "local pinned-binary probe (opencode 1.19.0 on Node 22.22.0, agents/probe-installed.mjs); route probe: this profile's own config_content.local overlay loaded and POST /v1/responses reached the injected baseURL carrying X-Cave-Agent: opencode, run completed (exit 0)",
     "fallback": "generic-env",
     "maintainer": null
   },
