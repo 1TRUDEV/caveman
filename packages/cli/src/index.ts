@@ -20510,7 +20510,24 @@ function keychainDelete() {
   genericKeychainDelete(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
 }
 
+// Without a default keychain (a sudo or remote shell, a fresh account),
+// `security add-generic-password` opens macOS's "A keychain cannot be found to
+// store" dialog and waits on it instead of failing, so every caller falls back
+// to its 0600 file without asking. `security default-keychain` only exits
+// non-zero.
+function hasDefaultKeychain(): boolean {
+  try {
+    const path = execFileSync("security", ["default-keychain"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim()
+      .replace(/^"|"$/g, "");
+    return path !== "" && existsSync(path);
+  } catch {
+    return false;
+  }
+}
+
 function genericKeychainSet(service: string, account: string, secret: string): boolean {
+  if (!hasDefaultKeychain()) return false;
   try {
     execFileSync("security", ["add-generic-password", "-U", "-s", service, "-a", account, "-w", secret], { stdio: "ignore" });
     return true;

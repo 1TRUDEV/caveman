@@ -247,6 +247,31 @@ test("device login stores the complete grant only in a mode-0600 credential enve
   }
 });
 
+test("device login with no default keychain stores the 0600 file and never opens the macOS keychain dialog", async () => {
+  const paths = isolatedEnv();
+  // The fake security exits non-zero for default-keychain, as in a sudo or remote shell.
+  const securityLog = installFakeSecurity(paths, "");
+  const accessToken = makeToken({ org: "org-nokeychain" });
+  const server = createServer(async (req, res) => {
+    await requestBody(req);
+    if (req.url === "/api/v1/auth/device/code") return send(res, 200, { device_code: "device-nk", user_code: "ABCD-2345", verification_uri: "https://app.caveman.cloud/activate", expires_in: 60, interval: 0 });
+    if (req.url === "/api/v1/auth/device/token") return send(res, 200, { access_token: accessToken, refresh_token: "refresh-nk", gateway_api_key: "cave_live_nk", gateway_key_id: "key-nk", project_id: "project-nk", delivery_ack_token: "ack-nk" });
+    if (req.url === "/api/v1/auth/device/ack") return send(res, 200, { acknowledged: true });
+    send(res, 404, {});
+  });
+  const port = await listen(server);
+  try {
+    const result = await runCli(["login", "--base-url", `http://127.0.0.1:${port}`], paths.env);
+    assert.equal(result.code, 0, result.stderr);
+    const calls = existsSync(securityLog) ? readFileSync(securityLog, "utf8") : "";
+    assert.doesNotMatch(calls, /add-generic-password/);
+    assert.equal(JSON.parse(readFileSync(paths.credentialsPath, "utf8")).access_token, accessToken);
+    assert.equal(JSON.parse(readFileSync(paths.configPath, "utf8")).tokenStore, "file");
+  } finally {
+    closeServer(server);
+  }
+});
+
 test("device login does not acknowledge until config persistence succeeds", async () => {
   const paths = isolatedEnv();
   const accessToken = makeToken({ org: "org-device-config-failure" });
