@@ -40,7 +40,8 @@ const routing = (fields) => ({ user: { email: "a@b.c" }, plan: "free", products:
 test("status shows routing's free decisions from /me", async () => {
   const { row, first } = await routingRow(routing({ free_allowance: 100000, used: 1204, period_end: "2026-11-01T00:00:00Z", state: "ok" }));
   assert.match(row, /^  on  routing +wired +wired +1,204 of 100,000 free decisions this month$/);
-  assert.match(first, /^routing has no effect on subscription turns$/m);
+  // Subscription turns route too.
+  assert.doesNotMatch(first, /no effect on subscription/);
 });
 
 test("a 401 from /me reads as an expired login", async () => {

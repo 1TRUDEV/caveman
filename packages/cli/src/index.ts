@@ -18811,8 +18811,6 @@ async function status(argv: string[]) {
   const degraded = native.filter((integration) => integration.state === "degraded").map((integration) => integration.agent);
   const lines = [...(routing.notice ? [routing.notice] : []), ...view.off_states.map((state) => state.fix ? `${state.line} · ${state.fix}` : state.line)];
   lines.push(traffic.fix ? `${traffic.line} · ${traffic.fix}` : traffic.line);
-  // ADR 0083 §7: subscription (OAuth Pro/Max) turns cost no per-request dollars.
-  if (modules.some((state) => state.id === "routing" && state.active)) lines.push("routing has no effect on subscription turns");
   const step = nextStep(modules, { degraded: degraded[0], fallback: next });
   process.stdout.write(renderModuleGrid(modules, { notes, next: traffic.next && step !== "caveman setup --install" ? traffic.next : step, degraded, lines }));
 }
