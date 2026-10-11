@@ -170,22 +170,50 @@ func TestRouteStageRejectedModelRetriesTheAskedOne(t *testing.T) {
 	}
 }
 
-// The request-wide opt-out and subscription traffic never ask.
-func TestRouteStageSkipsPassThroughAndSubscription(t *testing.T) {
+// The request-wide opt-out never asks.
+func TestRouteStageSkipsPassThrough(t *testing.T) {
 	cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
 	srv, models := routeServer(t, cloud, "")
 	sendMessages(t, srv, map[string]string{"x-cave-transforms": "caveman.pass-through.v1"})
-	sendMessages(t, srv, map[string]string{"x-api-key": "", "authorization": "Bearer sk-ant-oat01-subscription", "user-agent": "claude-cli/2.1.0"})
 	if len(cloud.asks) != 0 {
 		t.Fatalf("asks = %d, want none", len(cloud.asks))
 	}
-	for _, model := range *models {
-		if model != "claude-opus-5-5" {
-			t.Fatalf("upstream models = %v, want only the asked model", *models)
-		}
+	if got := *models; len(got) != 1 || got[0] != "claude-opus-5-5" {
+		t.Fatalf("upstream models = %v, want only the asked model", got)
 	}
-	if len(cloud.observed) != 2 || cloud.observed[0].RouteOutcome != "" || cloud.observed[1].RouteReason != "subscription" {
-		t.Errorf("observed = %d rows, outcomes %q / %q", len(cloud.observed), cloud.observed[0].RouteOutcome, cloud.observed[1].RouteReason)
+	if len(cloud.observed) != 1 || cloud.observed[0].RouteOutcome != "" {
+		t.Errorf("observed = %d rows, outcome %q", len(cloud.observed), cloud.observed[0].RouteOutcome)
+	}
+}
+
+// A subscription (Pro/Max OAuth) turn asks like an API-key one, in record and
+// compress mode alike, and the routed model goes upstream. Its row stays
+// tokens-only: the model swap is not a measured saving and carries no dollars.
+func TestRouteStageRoutesSubscriptionTurns(t *testing.T) {
+	for _, mode := range []string{"record", "compress"} {
+		cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
+		srv, models := routeServer(t, cloud, "")
+		srv.auth = stubAuth{rc: RequestContext{Label: "local", RuntimeMode: mode}}
+		srv.compressor = &liveZoneCompressor{} // compress mode takes the subscription pass-through break
+		rec := sendMessages(t, srv, map[string]string{"x-api-key": "", "authorization": "Bearer sk-ant-oat01-subscription", "user-agent": "claude-cli/2.1.0"})
+		if len(cloud.asks) != 1 {
+			t.Fatalf("%s: asks = %d, want one", mode, len(cloud.asks))
+		}
+		if got := *models; len(got) != 1 || got[0] != "claude-sonnet-5-5" {
+			t.Fatalf("%s: upstream models = %v, want the routed one", mode, got)
+		}
+		if rec.Header().Get("x-caveman-routed-from") != "claude-opus-5-5" {
+			t.Errorf("%s: x-caveman-routed-from = %q", mode, rec.Header().Get("x-caveman-routed-from"))
+		}
+		row := cloud.observed[0]
+		if row.AuthMode != "subscription" || row.RouteOutcome != "routed" || row.RouteFrom != "claude-opus-5-5" || row.Model != "claude-sonnet-5-5" {
+			t.Errorf("%s: row auth %q outcome %q from %q model %q", mode, row.AuthMode, row.RouteOutcome, row.RouteFrom, row.Model)
+		}
+		if row.TotalCostUSD != 0 || row.SavingsUSD != 0 || row.RequestTokensBefore != row.RequestTokensAfter ||
+			row.RequestEstimatedInputDeltaUSD != nil && *row.RequestEstimatedInputDeltaUSD != 0 {
+			t.Errorf("%s: subscription row claims a saving: cost %v savings %v tokens %d->%d delta %v", mode,
+				row.TotalCostUSD, row.SavingsUSD, row.RequestTokensBefore, row.RequestTokensAfter, row.RequestEstimatedInputDeltaUSD)
+		}
 	}
 }
 

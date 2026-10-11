@@ -678,3 +678,101 @@ func TestOpenCodeChatGPTSubscriptionDetection(t *testing.T) {
 		})
 	}
 }
+
+const chatGPTRouteBody = `{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}],"store":false}`
+
+// chatGPTRouteServer is a record-mode ChatGPT route on the real backend origin
+// (the route stage skips any other), served by rt.
+func chatGPTRouteServer(cloud CloudLink, rt http.RoundTripper, sink TelemetrySink, upstream string) *Server {
+	return New(Config{
+		Auth: stubAuth{rc: RequestContext{Label: "local", RuntimeMode: "record"}}, Sink: sink,
+		ChatGPTUpstream: upstream, HTTPClient: &http.Client{Transport: rt}, Cloud: cloud,
+	})
+}
+
+func sendChatGPT(srv *Server, header map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/chatgpt/responses", strings.NewReader(chatGPTRouteBody))
+	req.Header.Set("Authorization", "Bearer codex-oauth-secret")
+	req.Header.Set("ChatGPT-Account-ID", "acct_test")
+	req.Header.Set("x-cave-agent", "codex")
+	for name, value := range header {
+		req.Header.Set(name, value)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// A ChatGPT-login Codex turn asks with the openai pool and the routed model goes
+// to the subscription backend. The row names both models and stays tokens-only.
+func TestChatGPTRouteStageSwapsTheModelUpstream(t *testing.T) {
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed", Reason: "ranked"}}
+	rt := &captureTransport{responses: []string{`{"id":"resp","usage":{"input_tokens":90,"output_tokens":10}}`}}
+	sink := &captureSink{}
+	rec := sendChatGPT(chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream), nil)
+	if rec.Code != http.StatusOK || len(rt.bodies) != 1 {
+		t.Fatalf("status/calls = %d/%d, want 200/1", rec.Code, len(rt.bodies))
+	}
+	if want := strings.Replace(chatGPTRouteBody, `"gpt-6.1-sol"`, `"gpt-6-sol"`, 1); string(rt.bodies[0]) != want {
+		t.Fatalf("upstream body = %s, want only the model swapped", rt.bodies[0])
+	}
+	if got := rt.headers[0].Get("Authorization"); got != "Bearer codex-oauth-secret" {
+		t.Fatalf("OAuth authorization changed: %q", got)
+	}
+	if len(cloud.asks) != 1 || cloud.asks[0].Provider != "openai" || cloud.asks[0].Model != "gpt-6.1-sol" || cloud.asks[0].Agent != "codex" {
+		t.Fatalf("asks = %+v", cloud.asks)
+	}
+	if rec.Header().Get("x-caveman-routed-from") != "gpt-6.1-sol" {
+		t.Errorf("x-caveman-routed-from = %q", rec.Header().Get("x-caveman-routed-from"))
+	}
+	row := sink.last(t)
+	if row.Model != "gpt-6-sol" || row.RouteFrom != "gpt-6.1-sol" || row.RouteTo != "gpt-6-sol" || row.RouteOutcome != "routed" || row.AuthMode != "subscription" {
+		t.Errorf("row model %q from %q to %q outcome %q auth %q", row.Model, row.RouteFrom, row.RouteTo, row.RouteOutcome, row.AuthMode)
+	}
+	if row.TotalCostUSD != 0 || row.SavingsUSD != 0 || row.RequestMeasurementStatus != "measured" || row.RequestTokensBefore != row.RequestTokensAfter {
+		t.Errorf("routed subscription row claims a saving: %+v", row)
+	}
+}
+
+// A backend that refuses the routed model gets the exact original bytes, and the
+// row records the asked model with a degraded route, never "routed".
+func TestChatGPTRouteStageRejectedModelRetriesOriginalBytes(t *testing.T) {
+	rejected := 0
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed", Reject: func() { rejected++ }}}
+	rt := &captureTransport{statuses: []int{http.StatusBadRequest, http.StatusOK}}
+	sink := &captureSink{}
+	rec := sendChatGPT(chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream), nil)
+	if rec.Code != http.StatusOK || len(rt.bodies) != 2 {
+		t.Fatalf("status/calls = %d/%d, want 200/2", rec.Code, len(rt.bodies))
+	}
+	if !bytes.Equal(rt.bodies[1], []byte(chatGPTRouteBody)) {
+		t.Fatalf("retry must use exact original bytes:\n got %s\nwant %s", rt.bodies[1], chatGPTRouteBody)
+	}
+	if rejected != 1 || rec.Header().Get("x-caveman-routed-from") != "" {
+		t.Errorf("Reject called %d times, routed-from %q", rejected, rec.Header().Get("x-caveman-routed-from"))
+	}
+	row := sink.last(t)
+	if row.Model != "gpt-6.1-sol" || row.RouteTo != "gpt-6.1-sol" || row.RouteOutcome != "degraded" || row.RouteReason != "provider_rejected_routed_model" {
+		t.Errorf("row model %q to %q outcome %q reason %q", row.Model, row.RouteTo, row.RouteOutcome, row.RouteReason)
+	}
+}
+
+// The request-wide opt-out and a non-default backend never ask.
+func TestChatGPTRouteStageSkipsPassThroughAndCustomOrigin(t *testing.T) {
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+	rt := &captureTransport{}
+	sink := &captureSink{}
+	sendChatGPT(chatGPTRouteServer(cloud, rt, sink, DefaultChatGPTUpstream), map[string]string{"x-cave-transforms": "caveman.pass-through.v1"})
+	sendChatGPT(chatGPTRouteServer(cloud, rt, sink, "https://chatgpt.test/backend-api/codex"), nil)
+	if len(cloud.asks) != 0 {
+		t.Fatalf("asks = %d, want none", len(cloud.asks))
+	}
+	for _, body := range rt.bodies {
+		if string(body) != chatGPTRouteBody {
+			t.Fatalf("upstream body changed: %s", body)
+		}
+	}
+	if len(sink.rows) != 2 || sink.rows[0].RouteOutcome != "" || sink.rows[1].RouteReason != "custom_provider_origin" {
+		t.Errorf("rows %d, outcome %q / reason %q", len(sink.rows), sink.rows[0].RouteOutcome, sink.rows[1].RouteReason)
+	}
+}

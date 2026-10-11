@@ -52,9 +52,9 @@ type CloudLink interface {
 	Observe(rec RequestRecord)
 }
 
-// routable: Anthropic Messages or OpenAI chat/responses. Only API-key traffic
-// to the provider's own API is asked about: subscription (OAuth Pro/Max) turns
-// have no per-request dollar cost, so routing does nothing there (ADR 0083 §7).
+// routable: Anthropic Messages or OpenAI chat/responses. API-key, subscription
+// and OAuth traffic to the provider's own API is asked about alike; a
+// subscription row still records tokens only, never dollars.
 func routable(provider, endpoint string) bool {
 	switch provider {
 	case "anthropic":

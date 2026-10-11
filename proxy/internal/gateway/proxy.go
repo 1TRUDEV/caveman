@@ -222,9 +222,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		// OpenRouter, LiteLLM, a custom base URL) may not serve the pool.
 		upstream, uerr := adapter.ResolveUpstreamURL(r.Context(), r, providers.RouteContext{})
 		switch {
-		case authMode == AuthModeSubscription:
-			evidence.route = RouteAnswer{Outcome: "off", Reason: "subscription"}
-		case authMode != AuthModePAYG:
+		case authMode == AuthModeUnknown:
 		case uerr != nil || !statsPricingOriginKnown(meta.Provider, upstream):
 			evidence.route = RouteAnswer{Outcome: "off", Reason: "custom_provider_origin"}
 		default:
