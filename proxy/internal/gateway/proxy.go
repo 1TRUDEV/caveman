@@ -461,7 +461,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.doUpstream(r.Context(), buildUpstream(transform.Body, upstreamHeaders))
 	s.inflight.Add(-1)
 	if err != nil {
-		if meta.Model != modelRequested {
+		if meta.Model != modelRequested && r.Context().Err() == nil {
 			evidence.route.reject(false) // the agent's own retry goes to the asked model
 		}
 		httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unavailable", "Upstream provider unavailable.")
@@ -515,8 +515,13 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 		resp = retryResp
 		upstreamHeaders = retryHeaders
 		if routedAnswer.Outcome == "routed" && resp.StatusCode < 400 {
-			routedAnswer.reject(true)
-			evidence.route = RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
+			// transform.Body is still the refused request.
+			refused := onlyModelChanged(transform.Body, body, routedAnswer.Model)
+			routedAnswer.reject(refused)
+			evidence.route = RouteAnswer{Outcome: "degraded", Reason: "replayed_original"}
+			if refused {
+				evidence.route.Reason = "provider_rejected_routed_model"
+			}
 		}
 		transform = providers.TransformResult{Body: body, OptimizerIDs: []string{}}
 		evidence.acceptedBody = body
@@ -575,7 +580,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 	if !meta.Stream {
 		data, rerr := readUpstreamBody(resp)
 		if rerr != nil {
-			if meta.Model != modelRequested {
+			if meta.Model != modelRequested && r.Context().Err() == nil {
 				evidence.route.reject(false)
 			}
 			httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_body_read_failed", "Upstream response could not be read completely.")
@@ -646,7 +651,7 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request) {
 			errCode = "provider_stream_error"
 		}
 	}
-	if meta.Model != modelRequested && routedAttemptFailed(resp.StatusCode, errCode != "", finalUsage) {
+	if meta.Model != modelRequested && routedAttemptFailed(resp.StatusCode, finalUsage.ProviderError, copyErrCode == "cave_upstream_body_read_failed", finalUsage) {
 		evidence.route.reject(false) // the agent's own retry goes to the asked model
 	}
 	// The session ledger sees the provider's own numbers for the upstream call the

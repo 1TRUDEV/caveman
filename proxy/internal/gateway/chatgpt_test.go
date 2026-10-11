@@ -835,10 +835,37 @@ func TestChatGPTRouteStageCompressedAndRoutedRefused(t *testing.T) {
 	if rec.Code != http.StatusOK || len(rt.bodies) != 2 || !bytes.Equal(rt.bodies[1], []byte(body)) {
 		t.Fatalf("status/calls %d/%d, replay exact %v", rec.Code, len(rt.bodies), len(rt.bodies) == 2 && bytes.Equal(rt.bodies[1], []byte(body)))
 	}
+	// Compression changed the bytes too, so the replay getting through proves
+	// nothing about the model: Reject(false), and the row says the original
+	// bytes served. A model-only refusal is routedFailures' "refused, then served".
 	row := sink.last(t)
-	if fmt.Sprint(cloud.rejects) != "[true]" || rec.Header().Get("x-caveman-recovery-handle") != "" ||
-		row.Model != "gpt-6.1-sol" || row.RouteOutcome != "degraded" || row.CompressionTokensBefore != 0 || row.RecoveryHandle != "" {
-		t.Fatalf("rejects %v handle %q row model %q outcome %q comp %d", cloud.rejects, rec.Header().Get("x-caveman-recovery-handle"), row.Model, row.RouteOutcome, row.CompressionTokensBefore)
+	if fmt.Sprint(cloud.rejects) != "[false]" || rec.Header().Get("x-caveman-recovery-handle") != "" ||
+		row.Model != "gpt-6.1-sol" || row.RouteOutcome != "degraded" || row.RouteReason != "replayed_original" || row.CompressionTokensBefore != 0 || row.RecoveryHandle != "" {
+		t.Fatalf("rejects %v handle %q row model %q outcome %q reason %q comp %d", cloud.rejects, rec.Header().Get("x-caveman-recovery-handle"), row.Model, row.RouteOutcome, row.RouteReason, row.CompressionTokensBefore)
+	}
+}
+
+var responsesStream = map[string]string{
+	"start":     "event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
+	"delta":     "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+	"big":       "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"" + strings.Repeat("x", chatGPTCaptureLimit) + "\"}\n\n",
+	"done":      "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":90,\"output_tokens\":10}}}\n\n",
+	"failed":    "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"x\"},\"usage\":{\"input_tokens\":90,\"output_tokens\":3}}}\n\n",
+	"keepalive": ": keepalive\n\n",
+}
+
+func TestChatGPTRouteStageStreamEndsOnTheRoutedModel(t *testing.T) {
+	for _, tc := range streamEnds {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud := &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+			srv := chatGPTRouteServer(cloud, nil, &captureSink{}, DefaultChatGPTUpstream)
+			req := httptest.NewRequest(http.MethodPost, "/chatgpt/responses", strings.NewReader(chatGPTRouteBody))
+			req.Header.Set("Authorization", "Bearer codex-oauth-secret")
+			serveStream(srv, req, responsesStream, tc.parts, tc.upstreamBreaks, tc.clientStop)
+			if fmt.Sprint(cloud.rejects) != tc.rejects {
+				t.Fatalf("rejects %v, want %s", cloud.rejects, tc.rejects)
+			}
+		})
 	}
 }
 

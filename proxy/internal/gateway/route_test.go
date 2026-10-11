@@ -313,6 +313,168 @@ func TestRouteStageFailuresOnTheRoutedModel(t *testing.T) {
 	}
 }
 
+// streamEnds is how a 200 stream from the routed model ends. parts name events
+// each path spells in its own protocol; clientStop is how many parts the client
+// reads before it goes away (0: all of them); upstreamBreaks fails the upstream
+// read after the parts. Only the model failing moves the ask back: a client
+// leaving is the user stopping, and a completed answer is no failure however long.
+var streamEnds = []struct {
+	name           string
+	parts          []string
+	upstreamBreaks bool
+	clientStop     int
+	rejects        string
+}{
+	{"stream breaks before usage", []string{"start", "delta"}, true, 0, "[false]"},
+	{"client closes after a complete answer", []string{"start", "delta", "done", "keepalive"}, false, 3, "[]"},
+	{"client cancels mid-stream", []string{"start", "delta", "delta", "done"}, false, 2, "[]"},
+	{"provider error event with usage", []string{"start", "delta", "failed"}, false, 0, "[false]"},
+	{"answer over the capture limit completes, then the stream breaks", []string{"start", "big", "done"}, true, 0, "[]"},
+}
+
+// stoppingWriter is a client that goes away after limit bytes: its context is
+// canceled and the next write fails, as when the user presses Esc.
+type stoppingWriter struct {
+	header http.Header
+	n      int
+	limit  int
+	cancel func()
+}
+
+func (w *stoppingWriter) Header() http.Header { return w.header }
+func (w *stoppingWriter) WriteHeader(int)     {}
+func (w *stoppingWriter) Flush()              {}
+func (w *stoppingWriter) Write(p []byte) (int, error) {
+	if w.limit > 0 && w.n >= w.limit {
+		w.cancel()
+		return 0, errors.New("broken pipe")
+	}
+	w.n += len(p)
+	return len(p), nil
+}
+
+// breaksAtEOF turns the upstream's clean end into a reset.
+type breaksAtEOF struct{ r io.Reader }
+
+func (b breaksAtEOF) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err == io.EOF {
+		return n, errors.New("upstream reset")
+	}
+	return n, err
+}
+
+// serveStream sends req through srv with the upstream streaming the named parts.
+func serveStream(srv *Server, req *http.Request, events map[string]string, parts []string, upstreamBreaks bool, clientStop int) {
+	limit := 0
+	for i, part := range parts {
+		if i < clientStop {
+			limit += len(events[part])
+		}
+	}
+	srv.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		_, _ = io.ReadAll(r.Body)
+		readers := make([]io.Reader, len(parts))
+		for i, part := range parts {
+			readers[i] = strings.NewReader(events[part])
+		}
+		var body io.Reader = io.MultiReader(readers...)
+		if upstreamBreaks {
+			body = breaksAtEOF{body}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(body), Request: r}, nil
+	})}
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
+	func() {
+		defer func() { _ = recover() }() // the handler aborts a broken stream
+		srv.Handler().ServeHTTP(&stoppingWriter{header: http.Header{}, limit: limit, cancel: cancel}, req.WithContext(ctx))
+	}()
+}
+
+var anthropicStream = map[string]string{
+	"start":     "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+	"delta":     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+	"big":       "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"" + strings.Repeat("x", chatGPTCaptureLimit) + "\"}}\n\n",
+	"done":      "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	"failed":    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"x\"}}\n\n",
+	"keepalive": ": keepalive\n\n",
+}
+
+func TestRouteStageStreamEndsOnTheRoutedModel(t *testing.T) {
+	for _, tc := range streamEnds {
+		t.Run(tc.name, func(t *testing.T) {
+			cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
+			srv, _ := routeServer(t, cloud, "")
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-opus-5-5","max_tokens":5,"stream":true,"messages":[{"role":"user","content":"fix the bug"}]}`))
+			req.Header.Set("authorization", "Bearer sk-ant-oat01-subscription")
+			req.Header.Set("user-agent", "claude-cli/2.1.0")
+			serveStream(srv, req, anthropicStream, tc.parts, tc.upstreamBreaks, tc.clientStop)
+			if fmt.Sprint(cloud.rejects) != tc.rejects {
+				t.Fatalf("rejects %v, want %s", cloud.rejects, tc.rejects)
+			}
+		})
+	}
+}
+
+// The user stopping before any answer (Esc while the request is in flight) is
+// no failure of the routed model, on either path.
+func TestRouteStageClientCancelBeforeTheAnswerBlamesNoModel(t *testing.T) {
+	for _, path := range []string{"/v1/messages", "/chatgpt/responses"} {
+		t.Run(path, func(t *testing.T) {
+			var cloud *fakeCloud
+			var srv *Server
+			body := chatGPTRouteBody
+			if path == "/v1/messages" {
+				cloud = &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
+				srv, _ = routeServer(t, cloud, "")
+				body = `{"model":"claude-opus-5-5","max_tokens":5,"messages":[{"role":"user","content":"fix the bug"}]}`
+			} else {
+				cloud = &fakeCloud{answer: RouteAnswer{Model: "gpt-6-sol", Outcome: "routed"}}
+				srv = chatGPTRouteServer(cloud, nil, &captureSink{}, DefaultChatGPTUpstream)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			srv.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				cancel()
+				return nil, context.Canceled
+			})}
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)).WithContext(ctx)
+			req.Header.Set("authorization", "Bearer sk-ant-oat01-subscription")
+			req.Header.Set("user-agent", "claude-cli/2.1.0")
+			srv.Handler().ServeHTTP(httptest.NewRecorder(), req)
+			if len(cloud.asks) != 1 || len(cloud.rejects) != 0 {
+				t.Fatalf("asks %d rejects %v, want one ask and no reject", len(cloud.asks), cloud.rejects)
+			}
+		})
+	}
+}
+
+// Compressed and routed, refused: the original bytes getting through proves
+// nothing about the model (compression changed the bytes too), so the ask
+// moves back without a refusal on record.
+func TestRouteStageCompressedAndRoutedRefusalBlamesNoModel(t *testing.T) {
+	cloud := &fakeCloud{answer: RouteAnswer{Model: "claude-sonnet-5-5", Outcome: "routed"}}
+	srv, _ := routeServer(t, cloud, "")
+	rt := &captureTransport{statuses: []int{http.StatusBadRequest, http.StatusOK}, responses: []string{"", `{"id":"m","type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":2}}`}}
+	srv.httpClient = &http.Client{Transport: rt}
+	srv.auth = stubAuth{rc: RequestContext{Label: "local", RuntimeMode: "compress"}}
+	srv.compressor = &liveZoneCompressor{}
+	srv.recoveryViaMCP = true
+	srv.prefixCache = newTestPrefixCache()
+	body := `{"model":"claude-opus-5-5","max_tokens":5,"messages":[{"role":"user","content":"fix it"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"` + strings.Repeat("claude live tool output ", 60) + `"}]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("authorization", "Bearer sk-ant-oat01-subscription")
+	req.Header.Set("user-agent", "claude-cli/2.1.0")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || len(rt.bodies) != 2 || !strings.Contains(string(rt.bodies[0]), "<<ccr:") || string(rt.bodies[1]) != body {
+		t.Fatalf("status %d calls %d, first compressed %v, replay exact %v", rec.Code, len(rt.bodies), len(rt.bodies) > 0 && strings.Contains(string(rt.bodies[0]), "<<ccr:"), len(rt.bodies) == 2 && string(rt.bodies[1]) == body)
+	}
+	if row := cloud.observed[0]; fmt.Sprint(cloud.rejects) != "[false]" || row.RouteOutcome != "degraded" || row.RouteReason != "replayed_original" || row.Model != "claude-opus-5-5" {
+		t.Fatalf("rejects %v, row outcome %q reason %q model %q", cloud.rejects, row.RouteOutcome, row.RouteReason, row.Model)
+	}
+}
+
 // On the subscription path the routed request differs from the agent's only
 // in the model, in every runtime mode.
 func TestRouteStageSubscriptionChangesOnlyTheModel(t *testing.T) {

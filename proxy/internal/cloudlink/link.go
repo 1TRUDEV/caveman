@@ -46,7 +46,7 @@ const (
 	pauseRecheck = 15 * time.Minute // how often a limit pause asks /me whether it still holds
 	refusedPause = 10 * time.Minute // after a 401/403: a stale or revoked login
 	decisionsMax = 1024
-	refusedFor   = 30 * time.Minute // how long a provider's refusal of a routed model holds
+	rememberFor  = 30 * time.Minute // how long a decision or a provider's refusal of a routed model holds
 	answerMax    = 1 << 20
 )
 
@@ -75,7 +75,7 @@ type Link struct {
 	stale      bool // a background keychain read found a new secret
 	cfg        settings
 	decisions  map[string]*decision
-	refused    map[string]time.Time // session, provider, asked and routed model: when the provider refused it
+	refused    map[string]time.Time // ask scope (see scope) + routed model: when the provider refused it
 	pauseUntil time.Time
 	paused     gateway.RouteAnswer // what an ask answers while paused
 	recheckAt  time.Time           // the last /me check of a limit pause
@@ -93,6 +93,14 @@ type Link struct {
 type decision struct {
 	done   chan struct{}
 	answer gateway.RouteAnswer
+	at     time.Time
+}
+
+// scope is what one client's decisions and refusals belong to: the session,
+// or without one the agent and endpoint, so a ChatGPT-plan refusal never
+// reaches an API-key client on /openai/v1 or another agent.
+func scope(ask gateway.RouteAsk) string {
+	return strings.Join([]string{ask.SessionID, ask.Agent, ask.Endpoint, ask.Provider, ask.Model}, "\x00")
 }
 
 // New returns a link reading the CLI state under home ($CAVEMAN_HOME).
@@ -404,11 +412,13 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 	if query == "" {
 		return gateway.RouteAnswer{Outcome: "kept", Reason: "no_human_text"}
 	}
-	key := sha256.Sum256([]byte(ask.SessionID + "\x00" + ask.Provider + "\x00" + ask.Model + "\x00" + query))
+	prefix := scope(ask)
+	key := sha256.Sum256([]byte(prefix + "\x00" + query))
 	// Every tool-loop turn of one ask reuses its answer, failures included, so
 	// a turn never switches model halfway; a pause only stops new asks.
 	l.mu.Lock()
 	d, seen := l.decisions[string(key[:])]
+	seen = seen && l.now().Sub(d.at) < rememberFor
 	if !seen && l.now().Before(l.pauseUntil) {
 		paused := l.paused
 		l.mu.Unlock()
@@ -419,13 +429,23 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 		if l.decisions == nil || len(l.decisions) >= decisionsMax {
 			l.decisions = map[string]*decision{} // ponytail: drop all when full; an LRU if hit rates ever matter
 		}
-		d = &decision{done: make(chan struct{})}
+		d = &decision{done: make(chan struct{}), at: l.now()}
 		l.decisions[string(key[:])] = d
+		// A model the provider refused for this scope leaves the pool, so Cloud
+		// can still pick another and no decision is spent on a refusal.
+		models = slices.DeleteFunc(models, func(id string) bool {
+			at, refused := l.refused[prefix+"\x00"+id]
+			return id != ask.Model && refused && l.now().Sub(at) < rememberFor
+		})
 	}
 	l.mu.Unlock()
 	if !seen {
 		func() {
 			defer close(d.done) // waiters on this ask never hang, even on a panic
+			if len(models) == 1 {
+				d.answer = gateway.RouteAnswer{Outcome: "kept", Reason: "routed_model_refused_recently"}
+				return
+			}
 			d.answer = l.ask(cfg, bearer, ask, models, deadline)
 		}()
 	}
@@ -433,18 +453,10 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 	answer := d.answer
 	if answer.Model != "" {
 		k := string(key[:])
-		pair := ask.SessionID + "\x00" + ask.Provider + "\x00" + ask.Model + "\x00" + answer.Model
-		l.mu.Lock()
-		at, refused := l.refused[pair]
-		l.mu.Unlock()
-		if refused && l.now().Sub(at) < refusedFor {
-			// A field only the asked model accepts would be refused again: skip
-			// the wasted round trip and the replay.
-			return gateway.RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
-		}
+		pair := prefix + "\x00" + answer.Model
 		answer.Reject = func(refusedByProvider bool) {
 			// The rest of this ask keeps the asked model instead of failing over
-			// on every turn; a refusal also holds for the session's model pair.
+			// on every turn; a refusal also drops the model from this scope's pool.
 			reason := "routed_model_failed"
 			if refusedByProvider {
 				reason = "provider_rejected_routed_model"
@@ -453,7 +465,7 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 			close(done)
 			l.mu.Lock()
 			if l.decisions != nil {
-				l.decisions[k] = &decision{done: done, answer: gateway.RouteAnswer{Outcome: "degraded", Reason: reason}}
+				l.decisions[k] = &decision{done: done, answer: gateway.RouteAnswer{Outcome: "degraded", Reason: reason}, at: l.now()}
 			}
 			if refusedByProvider {
 				if l.refused == nil || len(l.refused) >= decisionsMax {

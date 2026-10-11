@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -52,12 +53,21 @@ func (a RouteAnswer) reject(refused bool) {
 	}
 }
 
-// routedAttemptFailed: the routed model answered 5xx, or its answer broke off
-// (stream error, provider error event, cancel) before the provider reported
-// usage. A 4xx is the replay's to judge, and a cancel after a complete answer
-// is no failure: Codex closes its stream on response.completed.
-func routedAttemptFailed(status int, broken bool, usage providers.UsageObservation) bool {
-	return status >= 500 || status < 400 && broken && !usage.Complete()
+// routedAttemptFailed: the routed model answered 5xx, reported a provider
+// error event, or its stream broke upstream before the provider reported usage.
+// A 4xx is the replay's to judge. broken is an upstream read failure only: a
+// client cancel (the user pressing Esc, Codex closing on response.completed) is
+// the user stopping, never the model failing.
+func routedAttemptFailed(status int, providerErr, broken bool, usage providers.UsageObservation) bool {
+	return status >= 500 || status < 400 && (providerErr || broken && !usage.Complete())
+}
+
+// onlyModelChanged: sent is original with nothing but the model swapped, so a
+// refusal the original bytes then got past is the routed model's. With
+// compression (or any other transform) in the mix the refusal proves nothing.
+func onlyModelChanged(sent, original []byte, model string) bool {
+	swapped, ok := setModel(original, model)
+	return ok && bytes.Equal(sent, swapped)
 }
 
 // CloudLink is the optional signed-in Cloud connection: the route stage asks

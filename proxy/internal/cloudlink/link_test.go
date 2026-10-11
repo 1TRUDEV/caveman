@@ -633,10 +633,13 @@ func TestRejectedModelKeepsTheAskOnTheAskedModel(t *testing.T) {
 	}
 }
 
-// A refusal holds for the session's asked/routed pair on later asks for
-// refusedFor; any other failure moves only the one ask back.
+// A refusal drops the routed model from that scope's pool for rememberFor:
+// with only the asked model left nothing is asked. Any other failure moves
+// only the one ask back, and another session keeps the full pool.
 func TestRefusalHoldsForTheSessionsModelPair(t *testing.T) {
+	var hits atomic.Int32
 	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
 		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
 	}))
 	defer cloud.Close()
@@ -655,15 +658,77 @@ func TestRefusalHoldsForTheSessionsModelPair(t *testing.T) {
 		t.Fatalf("a failure, not a refusal, held past its ask: %+v", next)
 	}
 	ask("s1", "third").Reject(true)
-	if next := ask("s1", "fourth"); next.Model != "" || next.Reason != "provider_rejected_routed_model" {
-		t.Fatalf("the refusal did not hold for the pair: %+v", next)
+	before := hits.Load()
+	if next := ask("s1", "fourth"); next.Model != "" || next.Outcome != "kept" || next.Reason != "routed_model_refused_recently" || hits.Load() != before {
+		t.Fatalf("the refused model stayed in the pool: %+v, cloud hits %d -> %d", next, before, hits.Load())
 	}
 	if other := ask("s2", "fourth"); other.Model != "claude-sonnet-5-5" {
 		t.Fatalf("another session inherited the refusal: %+v", other)
 	}
-	clock.Add(int64(refusedFor))
+	clock.Add(int64(rememberFor))
 	if later := ask("s1", "fifth"); later.Model != "claude-sonnet-5-5" {
-		t.Fatalf("the refusal outlived refusedFor: %+v", later)
+		t.Fatalf("the refusal outlived rememberFor: %+v", later)
+	}
+}
+
+// Without a session id a refusal is scoped to the agent and endpoint: Codex on
+// the ChatGPT plan (/responses) losing a model leaves an API-key client on
+// /openai/v1 its whole pool, and Codex's next ask still reaches Cloud with the
+// refused model left out. A cached decision also expires after rememberFor.
+func TestRefusalIsScopedToAgentAndEndpoint(t *testing.T) {
+	var mu sync.Mutex
+	var sent [][]string
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ask struct {
+			Models []string `json:"models"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&ask)
+		mu.Lock()
+		sent = append(sent, ask.Models)
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"model":"`+ask.Models[len(ask.Models)-1]+`","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	link := newLink(cloudHome(t, cloud.URL, true, `{"access_token":"`+token(time.Now().Add(time.Hour))+`"}`))
+	link.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	codex := func(text string) gateway.RouteAnswer {
+		body := `{"model":"gpt-6.1-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + text + `"}]}]}`
+		return link.Ask(t.Context(), gateway.RouteAsk{Provider: "openai", Endpoint: "/responses", Model: "gpt-6.1-sol", Agent: "codex", Body: []byte(body), InputBytes: len(body)})()
+	}
+	script := func(text string) gateway.RouteAnswer {
+		body := `{"model":"gpt-6.1-sol","messages":[{"role":"user","content":"` + text + `"}]}`
+		return link.Ask(t.Context(), gateway.RouteAsk{Provider: "openai", Endpoint: "/openai/v1/chat/completions", Model: "gpt-6.1-sol", Agent: "unlabeled-agent", Body: []byte(body), InputBytes: len(body)})()
+	}
+	first := codex("one")
+	if first.Model != "gpt-6-luna" {
+		t.Fatalf("first = %+v", first)
+	}
+	first.Reject(true)
+	if other := script("unrelated"); other.Model != "gpt-6-luna" {
+		t.Fatalf("an API-key client lost the model the ChatGPT plan refused: %+v", other)
+	}
+	if next := codex("two"); next.Model != "gpt-6-astra" {
+		t.Fatalf("codex next = %+v", next)
+	}
+	asked := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]string, len(sent))
+		for i, models := range sent {
+			out[i] = strings.Join(models, ",")
+		}
+		return out
+	}
+	if got, want := asked(), []string{"gpt-6.1-sol,gpt-6-sol,gpt-6-astra,gpt-6-luna", "gpt-6.1-sol,gpt-6-sol,gpt-6-astra,gpt-6-luna", "gpt-6.1-sol,gpt-6-sol,gpt-6-astra"}; !slices.Equal(got, want) {
+		t.Fatalf("models asked = %v\nwant %v", got, want)
+	}
+	script("unrelated") // cached
+	clock.Add(int64(rememberFor))
+	script("unrelated") // expired: asked again
+	if n := len(asked()); n != 4 {
+		t.Fatalf("asks = %d, want 4: a cached decision outlived rememberFor or was not cached", n)
 	}
 }
 

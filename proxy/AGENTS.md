@@ -101,15 +101,18 @@ the managed gateway (the managed gateway imports them from here). `caveman start
   stay tokens-only, and a routed model swap never counts as a compression saving). The
   ask starts before compression (parse, ask, compress, route), waits at most 800 ms, carries only
   the caller's models and counts (contracts `route-ask-v1`: no `text`, never prompt text), and
-  its answer is cached per ask so a tool loop
-  never switches model mid-turn. A Cloud error, timeout, 401/403, `allowance` or `billing_limit`
+  its answer is cached per ask (up to 30 min, keyed by session, or without one by agent and
+  endpoint) so a tool loop never switches model mid-turn. A Cloud error, timeout, 401/403, `allowance` or `billing_limit`
   answer keeps the asked model and pauses new asks (1 min; 10 min for 401/403 and billing_limit;
   until the 1st for allowance). Refusals and limits land in `$CAVEMAN_HOME/route-state.json`
   (with Cloud's notice) for `caveman status`; a new login lifts the pause. A provider 4xx (never
-  401/403) on a changed body replays the original bytes once on the asked model; only a replay
-  that succeeds blames the routed model (`Reject(true)`: the session's asked/routed pair then stays
-  on the asked model for 30 min), and one that fails too records `replay_failed`. A 5xx, transport
-  error or answer that breaks off before usage moves just that ask back (`Reject(false)`). The pass-through header and encoded bodies
+  401/403) on a changed body replays the original bytes once on the asked model. Only a replay that
+  succeeds after a model-only change blames the routed model (`Reject(true)`): it leaves the pool
+  for that session, or without a session id for that agent and endpoint, for 30 min, and with only
+  the asked model left no ask is sent (`kept`, `routed_model_refused_recently`). A replay that
+  fails too records `replay_failed`; one that succeeds after compression also changed the bytes
+  records `replayed_original` and blames no model. A 5xx, a provider error event or an upstream
+  break before usage moves just that ask back (`Reject(false)`); a client cancel never does. The pass-through header and encoded bodies
   never route, nor does any origin but the provider's own API (Azure, OpenRouter, LiteLLM, a
   custom base URL); record mode does (routing is its own module). A limit pause asks `/me` at
   most every 15 min and lifts once routing is no longer limited or the plan changed. runtime/v1

@@ -203,7 +203,7 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 		resp, err = s.httpClient.Do(upReq)
 	}
 	if err != nil {
-		if route.Outcome == "routed" {
+		if route.Outcome == "routed" && r.Context().Err() == nil {
 			route.reject(false) // the agent's own retry goes to the asked model
 		}
 		httpx.Error(w, r, http.StatusBadGateway, "cave_upstream_unreachable", "ChatGPT upstream is unreachable.")
@@ -241,8 +241,13 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 		}
 		resp = retryResp
 		if routedAnswer.Outcome == "routed" && resp.StatusCode < 400 {
-			routedAnswer.reject(true)
-			route = RouteAnswer{Outcome: "degraded", Reason: "provider_rejected_routed_model"}
+			// transform.Body is still the refused request.
+			refused := onlyModelChanged(transform.Body, originalBody, routedAnswer.Model)
+			routedAnswer.reject(refused)
+			route = RouteAnswer{Outcome: "degraded", Reason: "replayed_original"}
+			if refused {
+				route.Reason = "provider_rejected_routed_model"
+			}
 		}
 		transform = providers.TransformResult{Body: originalBody, OptimizerIDs: []string{}}
 		comp = nil
@@ -273,14 +278,19 @@ func (s *Server) chatgpt(w http.ResponseWriter, r *http.Request) {
 
 	respCapture := &cappedBuffer{limit: chatGPTCaptureLimit}
 	stream := streamingResponse(resp.Header)
-	counter, errCode := s.streamResponse(w, r, io.TeeReader(resp.Body, respCapture), stream, requestID)
-	respBytes := counter.n
+	src := io.TeeReader(resp.Body, respCapture)
+	var scanner *providers.UsageScanner
 	if route.Outcome == "routed" {
-		var usage providers.UsageObservation
-		if !respCapture.truncated {
-			providers.ParseUsageBytes("openai", respCapture.buf.Bytes(), &usage)
-		}
-		if routedAttemptFailed(resp.StatusCode, errCode != "" || usage.ProviderError, usage) {
+		// The adapter's scanner keeps the tail, so an answer past the capture
+		// limit that completed still reads as complete.
+		scanner = adapter.NewUsageScanner(resp.Header)
+		src = io.TeeReader(src, scanner)
+	}
+	counter, errCode := s.streamResponse(w, r, src, stream, requestID)
+	respBytes := counter.n
+	if scanner != nil {
+		usage := scanner.Usage()
+		if routedAttemptFailed(resp.StatusCode, usage.ProviderError, errCode == "cave_upstream_body_read_failed", usage) {
 			route.reject(false) // the agent's own retry goes to the asked model
 		}
 	}
