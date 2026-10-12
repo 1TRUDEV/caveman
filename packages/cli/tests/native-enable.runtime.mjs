@@ -1895,9 +1895,12 @@ test("enable claude refuses to overwrite a third-party ANTHROPIC_BASE_URL", asyn
 
 // The refusal must not catch caveman's own route: re-running enable, or an
 // install whose settings already carry a caveman gateway route, is the ordinary
-// idempotent path.
+// idempotent path. An explicitly written-out api.anthropic.com belongs in the
+// same list: the proxy's default anthropic upstream IS that host, so taking the
+// route over does not change where the request lands, and refusing would block
+// enable for everyone who spells the default out longhand.
 test("enable claude still takes over its own route and a managed caveman gateway route", async () => {
-  for (const owned of ["http://127.0.0.1:8787/w/claude", "https://gateway.caveman.so/w/claude"]) {
+  for (const owned of ["http://127.0.0.1:8787/w/claude", "https://gateway.caveman.so/w/claude", "https://api.anthropic.com"]) {
     const fx = fixture();
     mkdirSync(join(fx.home, ".claude"), { recursive: true });
     const settingsPath = join(fx.home, ".claude", "settings.json");

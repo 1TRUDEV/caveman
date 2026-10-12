@@ -7484,6 +7484,19 @@ function detectedAgentVersion(agent: AgentProfile): string | null { return nativ
 function claudeForeignRoute(previous: unknown, route: string): string | null {
   if (typeof previous !== "string" || previous.trim() === "") return null;
   if (previous === route || isCavemanClaudeRoute(previous, false)) return null;
+  // A user who pinned the first-party host explicitly loses nothing when the
+  // proxy's own anthropic upstream is that same host: the request reaches
+  // api.anthropic.com either way, so this is the ordinary install, not a
+  // conflict. Refusing it would block enable for everyone who writes the
+  // default out longhand. Only when the proxy forwards somewhere else does
+  // taking the route over actually change the destination.
+  try {
+    if (new URL(previous).host === "api.anthropic.com" && proxyAnthropicUpstreamIsFirstParty()) return null;
+  } catch {
+    // Unparseable: fall through and refuse. The value cannot be a working
+    // route, but silently discarding something the user typed is the behavior
+    // this guard exists to stop — and the refusal names removing it.
+  }
   return previous;
 }
 
@@ -7510,16 +7523,17 @@ function assertClaudeRouteNotForeign(settingsPath: string, previous: unknown, ro
   const configPath = process.env.CAVEMAN_CONFIG ?? join(cavemanHome(), "caveman.yaml");
   throw nativeUserConflict(
     `${settingsPath} already points ANTHROPIC_BASE_URL at ${foreign}.\n`
-    + "Enabling Caveman would replace that route with its own proxy, so every request would go to Caveman's\n"
-    + "anthropic upstream (api.anthropic.com) and your endpoint's key would be rejected.\n"
+    + "Enabling Caveman would replace that route with its own proxy, so every request would go to\n"
+    + "Caveman's own anthropic upstream (api.anthropic.com unless you changed it) and your endpoint's\n"
+    + "key would be rejected.\n"
     + `To keep both, set providers.anthropic.base_url in ${configPath} to that endpoint:\n`
     + "\n"
     + "  providers:\n"
     + "    anthropic:\n"
     + `      base_url: ${foreign}\n`
     + "\n"
-    + "then re-run this command. To route to api.anthropic.com instead, remove ANTHROPIC_BASE_URL from\n"
-    + "the settings file first.",
+    + "then re-run this command. To route through Caveman's own upstream instead, remove\n"
+    + "ANTHROPIC_BASE_URL from the settings file first.",
   );
 }
 
