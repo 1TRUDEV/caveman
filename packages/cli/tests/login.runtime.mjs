@@ -155,7 +155,7 @@ test("login rejects a non-2xx device-code response before polling", async () => 
   try {
     const result = await runCli(["login", "--no-browser", "--base-url", `http://127.0.0.1:${port}`], { ...process.env, HOME: home });
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /device authorization failed: HTTP 503/);
+    assert.match(result.stderr, /127\.0\.0\.1:\d+ is not answering right now \(HTTP 503\)\./);
     assert.equal(polls, 0);
   } finally {
     server.close();
@@ -287,7 +287,7 @@ test("login alone never changes where agent traffic goes", async () => {
   const stored = JSON.parse(readFileSync(join(caveDir, "cloud.json"), "utf8"));
   writeFileSync(join(caveDir, "cloud.json"), JSON.stringify({ ...stored, modules: { routing: true } }));
   const optedOut = await runCli(["login", "--no-browser", "--base-url", `http://127.0.0.1:${port}`], { ...env, DO_NOT_TRACK: "1" });
-  assert.match(optedOut.stderr, /^routing is on · the right model each turn · caveman off routing to stop$/m);
+  assert.match(optedOut.stderr, /^routing is on · adds Auto to your agent's model picker; each request on Auto sends your latest ask \(with what your agent attaches to it\), the one before it, the end of the agent's last reply and request facts \(tools, effort, agent headers, token counts\) to Caveman Cloud to pick the model and effort; on the Free plan Caveman may keep them to improve routing; requests go to your providers on your keys, only ones routed to a Caveman Cloud model pass through it · caveman off routing to stop$/m);
   assert.match(optedOut.stderr, /^runtime data: nothing sent \(telemetry is off\)/m);
 
   const cfg = JSON.parse(readFileSync(join(caveDir, "cloud.json"), "utf8"));

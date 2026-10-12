@@ -46,15 +46,31 @@ export function runtimeDataLevel(me: CloudMe | null, telemetryOff: boolean): str
   return typeof level === "string" && LEVELS.includes(level) ? level : "counts";
 }
 
-// After every sign-in: what routing does now and what data leaves the machine,
-// each with the way to stop it.
+// What routing sends, with its off switch: said at sign-in, by `caveman on
+// routing` and by setup when already signed in. The long form is SECURITY.md.
+export const ROUTING_ON_LINE = "routing is on · adds Auto to your agent's model picker; each request on Auto sends your latest ask (with what your agent attaches to it), the one before it, the end of the agent's last reply and request facts (tools, effort, agent headers, token counts) to Caveman Cloud to pick the model and effort; on the Free plan Caveman may keep them to improve routing; requests go to your providers on your keys, only ones routed to a Caveman Cloud model pass through it · caveman off routing to stop";
+
+// The same in three short rows, for the first-run screen: what goes, who may
+// keep it, how to stop it, and where every word is.
+export const ROUTING_ON_SHORT = [
+  "On Auto, your last two asks (with what the agent attaches), the end of its",
+  "last reply and request facts go to Caveman Cloud; the Free plan may keep them.",
+  "Stop: caveman off routing · every word: caveman on routing",
+];
+
 export async function printSignInLines(): Promise<void> {
+  for (const line of await signInLines()) process.stderr.write(`${line}\n`);
+}
+
+// After every sign-in: what routing does now and what data leaves the machine,
+// each with the way to stop it. Routing's line first, runtime data's second.
+export async function signInLines(): Promise<string[]> {
   const h = moduleHost();
   const lines: string[] = [];
   // The stored switch, as caveman-proxy reads it, not the registry default.
   const modules = h.readConfig().modules;
   const routing = !!modules && typeof modules === "object" && (modules as Record<string, unknown>).routing === true;
-  lines.push(routing ? "routing is on · the right model each turn · caveman off routing to stop" : "routing is off · caveman on routing to turn it on");
+  lines.push(routing ? ROUTING_ON_LINE : "routing is off · caveman on routing to turn it on");
   const telemetryOff = h.telemetryOff();
   const level = runtimeDataLevel(await cloudMe(), telemetryOff);
   lines.push(telemetryOff
@@ -62,7 +78,7 @@ export async function printSignInLines(): Promise<void> {
     : level === "off"
       ? "runtime data: nothing sent (your organization's data level is off)"
       : `runtime data: ${level} per request to your Cloud, never prompt text · caveman telemetry off to stop`);
-  for (const line of lines) process.stderr.write(`${line}\n`);
+  return lines;
 }
 
 export function cloudProduct(answer: CloudMe | null, id: string): CloudProduct | undefined {

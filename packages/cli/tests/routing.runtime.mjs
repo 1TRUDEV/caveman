@@ -40,8 +40,7 @@ const routing = (fields) => ({ user: { email: "a@b.c" }, plan: "free", products:
 test("status shows routing's free decisions from /me", async () => {
   const { row, first } = await routingRow(routing({ free_allowance: 100000, used: 1204, period_end: "2026-11-01T00:00:00Z", state: "ok" }));
   assert.match(row, /^  on  routing +wired +wired +1,204 of 100,000 free decisions this month$/);
-  // Subscription turns route too.
-  assert.doesNotMatch(first, /no effect on subscription/);
+  assert.doesNotMatch(first, /subscription turns/, "subscriptions route too");
 });
 
 test("a 401 from /me reads as an expired login", async () => {
@@ -127,6 +126,30 @@ test("status --json carries the plan from /me and no weekly cap", async () => {
     const json = JSON.parse(out.stdout);
     assert.deepEqual(json.plan, { plan: "free", products: [{ id: "routing", unit: "decision", free_allowance: 100000, used: 7, state: "ok" }] });
     assert.ok(!json.off_states.some((state) => state.id === "weekly-cap"));
+  } finally {
+    stub.close();
+    fx.cleanup();
+  }
+});
+
+// Turning routing on while signed in says what it sends, as the sign-in does;
+// signed out, nothing is sent yet and the sign-in will say it.
+test("on routing says what routing sends", async () => {
+  const fx = modulesFixture();
+  const stub = await cloud(routing({ free_allowance: 100000, used: 3, state: "ok" }));
+  const line = /^routing is on · adds Auto to your agent's model picker; each request on Auto sends your latest ask \(with what your agent attaches to it\), the one before it, the end of the agent's last reply and request facts \(tools, effort, agent headers, token counts\) to Caveman Cloud to pick the model and effort; on the Free plan Caveman may keep them to improve routing; requests go to your providers on your keys, only ones routed to a Caveman Cloud model pass through it · caveman off routing to stop$/m;
+  try {
+    assert.equal((await runCli(["off", "routing", "--yes"], fx.env)).code, 0);
+    const signedOut = await runCli(["on", "routing", "--yes"], fx.env);
+    assert.equal(signedOut.code, 0, signedOut.stderr);
+    assert.doesNotMatch(signedOut.stdout, line);
+    const env = { ...fx.env, CAVE_TOKEN: "test-token", CAVE_API_URL: stub.url };
+    assert.equal((await runCli(["off", "routing", "--yes"], env)).code, 0);
+    const on = await runCli(["on", "routing", "--yes"], env);
+    assert.equal(on.code, 0, on.stderr);
+    assert.match(on.stdout, line);
+    const again = await runCli(["on", "routing", "--yes"], env);
+    assert.match(again.stdout, line, "already on still says it");
   } finally {
     stub.close();
     fx.cleanup();

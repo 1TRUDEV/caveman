@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { harness, modulesFixture, runCli, snapshot } from "./_modules.mjs";
 
@@ -188,6 +188,8 @@ test("off keeps agent wiring while another module needs it", async () => {
 
     assert.equal((await runCli(["off", "output", "waste-fixes", "--yes"], fx.env)).code, 0);
     assert.ok(journal(), "wiring must stay while routing is on");
+    // caveman-proxy's cache warming reads this module state itself.
+    assert.equal(JSON.parse(readFileSync(join(fx.home, ".caveman", "cloud.json"), "utf8")).modules["waste-fixes"], false);
 
     const before = snapshot(fx.home);
     const dry = await runCli(["off", "routing", "--dry-run"], fx.env);
@@ -203,6 +205,53 @@ test("off keeps agent wiring while another module needs it", async () => {
     assert.equal(last.code, 0, last.stderr);
     assert.equal(journal(), false, "last agent-wired module off must unwire");
     assert.equal(existsSync(join(fx.home, ".claude", "settings.json")), false);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+// The module state is what status reports: it must not say off over an agent
+// whose unwire failed, and running off again has to retry that unwire.
+test("off whose unwire fails keeps the agent-wired modules on, and off again finishes", { skip: process.platform === "win32" || process.getuid?.() === 0 ? "chmod does not block root or Windows" : false }, async () => {
+  const fx = modulesFixture();
+  const codex = join(fx.home, ".codex");
+  const stored = () => JSON.parse(readFileSync(join(fx.home, ".caveman", "cloud.json"), "utf8"));
+  try {
+    assert.equal((await runCli(["on", "--all", "--yes"], fx.env)).code, 0);
+    const keys = stored().think;
+    chmodSync(codex, 0o500);
+    const off = await runCli(["off", "--all", "--yes"], fx.env);
+    chmodSync(codex, 0o700);
+    assert.equal(off.code, 1, off.stdout);
+    assert.match(off.stdout, /^✓ Claude Code unwired$/m);
+    assert.match(off.stderr, /^✗ codex: /m);
+    assert.match(off.stderr, /^✗ output, input, waste-fixes, and routing stay on while Codex is still wired; fix the problem above, then run this again$/m);
+    assert.deepEqual(stored().modules, { output: true, input: true, "waste-fixes": true, routing: true, scripts: false, browse: false });
+    assert.deepEqual(stored().think, keys, "keys the kept modules own changed");
+    const status = JSON.parse((await runCli(["status", "--json"], fx.env)).stdout);
+    assert.equal(status.modules.find((state) => state.id === "input").perAgent.codex, "wired");
+
+    const again = await runCli(["off", "--all", "--yes"], fx.env);
+    assert.equal(again.code, 0, again.stderr);
+    assert.match(again.stdout, /^✓ Codex unwired$/m);
+    assert.deepEqual(stored().modules, { output: false, input: false, "waste-fixes": false, routing: false, scripts: false, browse: false });
+  } finally {
+    chmodSync(codex, 0o700);
+    fx.cleanup();
+  }
+});
+
+test("off over a cloud.json it cannot write changes nothing, agents included", async () => {
+  const fx = modulesFixture({ agents: ["claude"] });
+  const path = join(fx.home, ".caveman", "cloud.json");
+  try {
+    assert.equal((await runCli(["on", "--all", "--yes"], fx.env)).code, 0);
+    writeFileSync(path, readFileSync(path, "utf8").replace(/\n}$/, ",\n}"));
+    const before = snapshot(fx.home);
+    const off = await runCli(["off", "--all", "--yes"], fx.env);
+    assert.equal(off.code, 1, off.stdout);
+    assert.ok(off.stderr.includes(`${path} is not valid JSON`), off.stderr);
+    assert.deepEqual(snapshot(fx.home), before, "an agent was unwired under a config that refuses the write");
   } finally {
     fx.cleanup();
   }
@@ -414,3 +463,93 @@ test("a primary key that contradicts the module state is reconciled", async () =
   }
 });
 
+
+test("switching routing off and on takes Auto out of and back into wired agents", async () => {
+  const fx = modulesFixture({ agents: ["claude"], blocks: true });
+  fx.env.CAVE_TOKEN = "signed-in"; // Auto shows only while signed in
+  const auto = () => JSON.parse(readFileSync(join(fx.home, ".claude", "settings.json"), "utf8")).env.ANTHROPIC_CUSTOM_MODEL_OPTION;
+  try {
+    assert.equal((await runCli(["on", "--all", "--yes"], fx.env)).code, 0);
+    assert.equal(auto(), "caveman-auto[1m]");
+    const off = await runCli(["off", "routing", "--yes"], fx.env);
+    assert.equal(off.code, 0, off.stderr);
+    assert.deepEqual(planLines(off.stdout), [
+      ["UPDATE", "~/.caveman/cloud.json", "modules off: routing"],
+      ["UPDATE", "~/.claude/settings.json", "refresh claude hooks"],
+      ["UPDATE", "~/.claude.json", "refresh claude hooks"],
+    ]);
+    assert.equal(auto(), undefined);
+    assert.equal((await runCli(["on", "routing", "--yes"], fx.env)).code, 0);
+    assert.equal(auto(), "caveman-auto[1m]");
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test("on wires nothing the user disabled; a module switched off wires again", async () => {
+  const fx = modulesFixture({ agents: ["claude", "codex"] });
+  const wired = (agent) => existsSync(join(fx.env.CAVEMAN_HOME, "integrations", `${agent}.json`));
+  const optOut = () => JSON.parse(readFileSync(join(fx.env.CAVEMAN_HOME, "cloud.json"), "utf8")).nativeOptOut;
+  try {
+    assert.equal((await runCli(["on", "--all", "--yes"], fx.env)).code, 0);
+    assert.ok(wired("claude") && wired("codex"));
+    // `off` is a module choice, not an agent one: `on` brings the agents back.
+    assert.equal((await runCli(["off", "--all", "--yes"], fx.env)).code, 0);
+    assert.ok(!wired("claude") && !wired("codex"));
+    assert.equal(optOut(), undefined);
+    assert.equal((await runCli(["on", "--all", "--yes"], fx.env)).code, 0);
+    assert.ok(wired("claude") && wired("codex"));
+
+    for (const agent of ["claude", "codex"]) assert.equal((await runCli(["disable", agent], fx.env)).code, 0, agent);
+    assert.deepEqual(optOut(), ["claude", "codex"]);
+    assert.equal((await runCli(["enable", "codex"], fx.env)).code, 0);
+    assert.equal((await runCli(["disable", "codex"], fx.env)).code, 0);
+    assert.equal((await runCli(["off", "routing", "--yes"], fx.env)).code, 0);
+    // Nothing is wired now, and both agents are on PATH: neither comes back.
+    const on = await runCli(["on", "routing", "--yes"], fx.env);
+    assert.equal(on.code, 0, on.stderr);
+    assert.ok(!wired("claude") && !wired("codex"), on.stdout);
+    // `enable` is how a disabled agent comes back, and `on` follows it again.
+    assert.equal((await runCli(["enable", "claude"], fx.env)).code, 0);
+    assert.deepEqual(optOut(), ["codex"]);
+    assert.ok(wired("claude") && !wired("codex"));
+  } finally {
+    fx.cleanup();
+  }
+});
+
+// An agent pointed at its own endpoint (a company gateway, LiteLLM) is not
+// re-pointed at the proxy, whose upstream is the public vendor API: its traffic
+// and gateway token would go there. The plan and the run say so; it is a skip.
+test("an agent on its own endpoint is left as is, in the plan and in the run", async () => {
+  const fx = modulesFixture();
+  try {
+    const settingsPath = join(fx.home, ".claude", "settings.json");
+    mkdirSync(join(fx.home, ".claude"), { recursive: true });
+    const settings = JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://llm-gw.corp.example/anthropic", ANTHROPIC_AUTH_TOKEN: "corp-token" } }, null, 2) + "\n";
+    writeFileSync(settingsPath, settings);
+    const plan = await runCli(["on", "--all", "--dry-run"], fx.env);
+    assert.equal(plan.code, 0, plan.stderr);
+    assert.doesNotMatch(plan.stdout, /claude settings|claude config/);
+    assert.match(plan.stdout, /^note: Claude Code stays as is: it sends its requests to its own endpoint https:\/\/llm-gw\.corp\.example\/anthropic$/m);
+    const on = await runCli(["on", "--all", "--yes"], fx.env);
+    assert.equal(on.code, 0, on.stderr);
+    assert.match(on.stdout, /^○ Claude Code sends its requests to its own endpoint .* so Claude Code was left as is\. To route it through Caveman anyway, remove ANTHROPIC_BASE_URL there and run `caveman enable claude`\.$/m);
+    assert.match(on.stdout, /^✓ Codex wired$/m);
+    assert.equal(readFileSync(settingsPath, "utf8"), settings);
+    assert.equal(existsSync(join(fx.home, ".claude.json")), false);
+
+  } finally {
+    fx.cleanup();
+  }
+  // Settings env outranks the shell's, so an exported endpoint is the same.
+  const shellFx = modulesFixture();
+  try {
+    const shell = await runCli(["on", "--all", "--yes"], { ...shellFx.env, ANTHROPIC_BASE_URL: "http://localhost:4000" });
+    assert.equal(shell.code, 0, shell.stderr);
+    assert.match(shell.stdout, /^○ .*http:\/\/localhost:4000 \(ANTHROPIC_BASE_URL in your shell\)\..* remove ANTHROPIC_BASE_URL from your shell and run `caveman enable claude`\.$/m);
+    assert.equal(existsSync(join(shellFx.home, ".claude", "settings.json")), false);
+  } finally {
+    shellFx.cleanup();
+  }
+});

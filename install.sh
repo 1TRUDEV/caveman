@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # caveman — installer shim.
 #
-# Thin wrapper around bin/install.js (the unified Node installer). Every flag
-# you'd pass to bin/install.js can be passed here; we just forward them.
+# Thin wrapper around installer/install.js (the unified Node installer). Every flag
+# you'd pass to installer/install.js can be passed here; we just forward them.
 #
 # One-line install:
 #   curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/v1.10.0/install.sh | bash
@@ -22,10 +22,10 @@
 set -euo pipefail
 
 REPO="JuliusBrussee/caveman"
-PINNED_REF="${CAVEMAN_REF:-v3.1.0}"
+PINNED_REF="${CAVEMAN_REF:-v3.2.0}"
 # The CLI release the first run comes from when caveman is not installed;
 # kept equal to packages/cli/package.json (tests/installer/shim-security).
-CLI_VERSION="2.0.1"
+CLI_VERSION="2.1.0"
 
 # Require Node ≥18. nvm is a common path; print a hint if missing.
 if ! command -v node >/dev/null 2>&1; then
@@ -45,15 +45,38 @@ fi
 # first_run ends the install in the CLI's first run. The terminal comes from
 # /dev/tty because under curl | bash stdin is the script itself.
 first_run() {
+  launch=1
   for arg in "$@"; do
-    case "$arg" in -h|--help|--list|-u|--uninstall|--dry-run) return 0 ;; esac
+    case "$arg" in
+      -h|--help|--list|-u|--uninstall|--dry-run) return 0 ;;
+      # Never prompt: name the first run instead of starting it.
+      --non-interactive) launch=0 ;;
+    esac
   done
-  if command -v caveman >/dev/null 2>&1; then
+  # The skills above run on Node 18; the CLI (runtime, routing) needs 22.13.
+  node_version=$(node -p "process.versions.node")
+  node_minor=${node_version#*.}
+  node_minor=${node_minor%%.*}
+  case "$node_minor" in ''|*[!0-9]*) node_minor=0 ;; esac
+  if [ "$NODE_MAJOR" -lt 22 ] || { [ "$NODE_MAJOR" -eq 22 ] && [ "$node_minor" -lt 13 ]; }; then
+    echo
+    echo "caveman: skills installed. The runtime (smaller inputs, Auto routing) needs Node 22.13+; this is v$node_version."
+    echo "  Upgrade Node (https://nodejs.org), then run: npx -y @caveman-ai/cli@$CLI_VERSION"
+    return 0
+  fi
+  # The caveman on PATH when it is this release or newer: an older CLI has an
+  # older setup, so npx runs this one and its setup installs it for good, but
+  # over a newer CLI that would be a downgrade. A prerelease ranks below its
+  # own release, and two prereleases of one release rank as semver orders
+  # them; a version that cannot be read counts as older. The probe gives up
+  # after 10s (macOS has no `timeout`). install.ps1 carries it too.
+  if command -v caveman >/dev/null 2>&1 &&
+    node -e 'const r=require(`child_process`).spawnSync(`caveman --version`,{shell:true,encoding:`utf8`,timeout:1e4,killSignal:`SIGKILL`,stdio:[`ignore`,`pipe`,`ignore`],windowsHide:true});const v=s=>(s=/^(\d+)\.(\d+)\.(\d+)(?:-([\w.-]+))?/.exec(s))&&[s[1],s[2],s[3],+!s[4],...s[4]?s[4].split(`.`):[]].map(x=>/^\d+$/.test(x)?+x:x);let h;try{h=v(JSON.parse(r.stdout).version)}catch{}const c=(a,b)=>a===b?0:a===undefined?-1:b===undefined?1:typeof a!=typeof b?(typeof a==`number`?-1:1):a<b?-1:1;const w=v(process.argv[1]),d=h&&w&&[...h,...w].map((_,i)=>c(h[i],w[i])).find(x=>x);process.exitCode=h&&w&&!(d<0)?0:1' "$CLI_VERSION" </dev/null 2>/dev/null; then
     set -- caveman setup
   else
     set -- npx -y "@caveman-ai/cli@$CLI_VERSION" setup
   fi
-  if [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
+  if [ "$launch" = 1 ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
     echo
     "$@" </dev/tty
   else
@@ -65,25 +88,39 @@ first_run() {
 # the npx round-trip and keeps offline installs working. BASH_SOURCE is unset
 # when bash is invoked from stdin (curl | bash). Do not feed an empty value to
 # dirname: dirname "" resolves to "." and would execute an unrelated
-# $PWD/bin/install.js from the caller's checkout.
+# $PWD/installer/install.js from the caller's checkout.
 here=""
 source_path="${BASH_SOURCE[0]:-}"
 if [ -n "$source_path" ]; then
   here="$(cd "$(dirname "$source_path")" 2>/dev/null && pwd)" || here=""
 fi
-if [ -n "$here" ] && [ -f "$here/bin/install.js" ]; then
-  node "$here/bin/install.js" "$@"
+if [ -n "$here" ] && [ -f "$here/installer/install.js" ]; then
+  node "$here/installer/install.js" "$@"
   first_run "$@"
   exit 0
 fi
 
 # Curl-pipe path: delegate to npx. We do NOT pass `--` here — npm 7+ npx
 # already forwards trailing args to the package, and a literal `--` tripped
-# bin/install.js's parseArgs as an unknown flag.
+# installer/install.js's parseArgs as an unknown flag.
 if ! command -v npx >/dev/null 2>&1; then
   echo "caveman: npx required (ships with Node ≥18). Reinstall Node.js." >&2
   exit 1
 fi
 
-npx -y "github:$REPO#$PINNED_REF" "$@"
+# npm 12 disables git package fetches by default (EALLOWGIT). Allow only the
+# root package requested here; keep the old invocation for npm versions that
+# predate this config flag.
+NPX_VERSION=""
+if NPX_VERSION=$(npx --version 2>/dev/null); then :; fi
+NPX_MAJOR=${NPX_VERSION%%.*}
+case "$NPX_MAJOR" in
+  ''|*[!0-9]*) NPX_MAJOR=0 ;;
+esac
+
+if [ "$NPX_MAJOR" -ge 12 ]; then
+  npx --allow-git=root -y "github:$REPO#$PINNED_REF" "$@"
+else
+  npx -y "github:$REPO#$PINNED_REF" "$@"
+fi
 first_run "$@"

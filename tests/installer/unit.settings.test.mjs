@@ -1,4 +1,4 @@
-// Unit tests for bin/lib/settings.js — the JSONC-tolerant settings helper.
+// Unit tests for installer/lib/settings.js — the JSONC-tolerant settings helper.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +8,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const SETTINGS = require('../../bin/lib/settings.js');
+const SETTINGS = require('../../installer/lib/settings.js');
 
 function tmpFile(name, contents) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-settings-'));
@@ -74,6 +74,17 @@ test('readSettings handles JSONC (comments + trailing commas)', () => {
   assert.deepEqual(SETTINGS.readSettings(p), { theme: 'dark', hooks: {} });
 });
 
+// Windows PowerShell 5.1 `Set-Content -Encoding UTF8` starts the file with a
+// UTF-8 BOM. JSON.parse rejects it, so the installer refused to merge.
+test('readSettings accepts a UTF-8 BOM and writeSettings keeps it', () => {
+  const p = tmpFile('s.json', '﻿{"theme":"dark"}\r\n');
+  assert.deepEqual(SETTINGS.readSettings(p), { theme: 'dark' });
+  SETTINGS.writeSettings(p, { theme: 'light' });
+  const bytes = fs.readFileSync(p);
+  assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'BOM dropped on write');
+  assert.deepEqual(SETTINGS.readSettings(p), { theme: 'light' });
+});
+
 test('readSettings returns {} for missing file', () => {
   assert.deepEqual(SETTINGS.readSettings('/nonexistent/path/xyz.json'), {});
 });
@@ -100,6 +111,18 @@ test('writeSettings removes its temporary file when rename fails', () => {
     fs.readdirSync(dir).filter((name) => name.startsWith('.settings.json.') && name.endsWith('.tmp')),
     [],
   );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('writeSettings writes a linked settings file at its target and keeps the link', { skip: process.platform === 'win32' }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-settings-link-'));
+  const target = path.join(dir, 'dotfiles-settings.json');
+  fs.writeFileSync(target, '{}\n');
+  const link = path.join(dir, 'settings.json');
+  fs.symlinkSync(target, link);
+  SETTINGS.writeSettings(link, { a: 1 });
+  assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { a: 1 });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -134,6 +157,37 @@ test('addCommandHook is idempotent on substring marker', () => {
   assert.equal(a, true);
   assert.equal(b, false);
   assert.equal(s.hooks.SessionStart.length, 1);
+});
+
+// Re-running the installer is the obvious repair for a hook whose baked node
+// path died (brew upgrade, removed nvm version) or that still has the pre-#835
+// PowerShell form. addCommandHook used to stop at the marker and keep both.
+test('addCommandHook rewrites our stale hook command in place', () => {
+  const opts = (command) => ({ command, marker: 'caveman-activate' });
+  const fresh = '"/opt/homebrew/bin/node" "/h/hooks/caveman-activate.js"';
+  for (const [stale, now] of [
+    ['"/opt/homebrew/Cellar/node/26.5.0/bin/node" "/h/hooks/caveman-activate.js"', fresh],
+    ["& 'C:\\Program Files\\nodejs\\node.exe' 'C:\\Users\\me\\.claude\\hooks\\caveman-activate.js'",
+      '"C:/Program Files/nodejs/node.exe" "C:/Users/me/.claude/hooks/caveman-activate.js"'],
+  ]) {
+    const s = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: stale, timeout: 30 }] }] } };
+    assert.ok(SETTINGS.addCommandHook(s, 'SessionStart', opts(now)), `not repaired: ${stale}`);
+    assert.deepEqual(s.hooks.SessionStart, [{ hooks: [{ type: 'command', command: now, timeout: 30 }] }]);
+    assert.equal(SETTINGS.addCommandHook(s, 'SessionStart', opts(now)), false);
+  }
+  // A hook pointed at another copy of the script (a dev clone) stays put.
+  const clone = '"/usr/bin/node" "/src/caveman/src/hooks/caveman-activate.js"';
+  const elsewhere = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: clone }] }] } };
+  assert.equal(SETTINGS.addCommandHook(elsewhere, 'SessionStart', opts(fresh)), false);
+  assert.equal(elsewhere.hooks.SessionStart[0].hooks[0].command, clone);
+  const record = { hooks: { SessionEnd: [{ hooks: [{ type: 'command', command: '"/gone/node" "/h/caveman-stats.js" --record' }] }] } };
+  SETTINGS.addCommandHook(record, 'SessionEnd', { command: '"/new/node" "/h/caveman-stats.js" --record', marker: 'caveman-stats' });
+  assert.equal(record.hooks.SessionEnd[0].hooks[0].command, '"/new/node" "/h/caveman-stats.js" --record');
+  // A hand-edited command (env prefix, wrapper) stays the user's.
+  const custom = 'CAVEMAN_DEFAULT_MODE=ultracave node /h/hooks/caveman-activate.js';
+  const s = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: custom }] }] } };
+  assert.equal(SETTINGS.addCommandHook(s, 'SessionStart', opts(fresh)), false);
+  assert.equal(s.hooks.SessionStart[0].hooks[0].command, custom);
 });
 
 test('hasCavemanHook detects via substring', () => {
@@ -252,6 +306,33 @@ test('rewriteLegacyManagedHookCommands emits a bash-safe command on Windows', ()
   );
 });
 
+// src/hooks/install.{sh,ps1} write the SessionEnd recorder as
+// `node "<dir>/caveman-stats.js" --record`. The trailing flag must not stop the
+// migration, or addCommandHook sees the marker and leaves it on bare `node`.
+test('rewriteLegacyManagedHookCommands keeps trailing flags on bare-node scripts', () => {
+  const s = {
+    hooks: {
+      SessionEnd: [{ hooks: [{ type: 'command', command: 'node "/h/caveman-stats.js" --record' }] }],
+    },
+  };
+  const n = SETTINGS.rewriteLegacyManagedHookCommands(s, '/usr/local/bin/node', 'linux');
+  assert.equal(n, 1);
+  assert.equal(s.hooks.SessionEnd[0].hooks[0].command, '"/usr/local/bin/node" "/h/caveman-stats.js" --record');
+});
+
+// src/hooks/install.sh wires SubagentStart as a bare `node <activate> --subagent`.
+test('rewriteLegacyManagedHookCommands keeps the --subagent flag', () => {
+  const s = {
+    hooks: {
+      SubagentStart: [{ hooks: [{ type: 'command', command: 'node "/abs/hooks/caveman-activate.js" --subagent' }] }],
+    },
+  };
+  const n = SETTINGS.rewriteLegacyManagedHookCommands(s, '/usr/local/bin/node', 'linux');
+  assert.equal(n, 1);
+  assert.equal(s.hooks.SubagentStart[0].hooks[0].command,
+    '"/usr/local/bin/node" "/abs/hooks/caveman-activate.js" --subagent');
+});
+
 test('rewriteLegacyManagedHookCommands ignores already-absolute node commands', () => {
   const s = {
     hooks: {
@@ -289,8 +370,12 @@ test('pruneOrphanedManagedHooks removes managed hook whose target is missing (ab
   assert.equal(s.hooks, undefined);
 });
 
-test('pruneOrphanedManagedHooks keeps a foreign-platform absolute path it cannot judge', () => {
-  // A roaming settings.json written on Windows, processed on POSIX: posix
+test('pruneOrphanedManagedHooks keeps a foreign-platform absolute path it cannot judge', {
+  // The fixture is a Windows path. On win32 that path is native, so a missing
+  // file is a real orphan. The case under test is POSIX reading that path.
+  skip: process.platform === 'win32' ? 'Windows path is native on win32' : false,
+}, () => {
+  // A roaming settings.json written on Windows, processed on POSIX: path
   // .isAbsolute() says false for `C:\...`, so the old code joined it under
   // baseDir, found nothing, and pruned a hook that is live on the machine that
   // wrote it. Existence is only knowable for paths of our own platform.
