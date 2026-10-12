@@ -118,8 +118,10 @@ Supabase database. Its source and table schema live in [`supabase/`](./supabase/
 <https://github.com/caveman-ai/blocks/blob/main/docs/TELEMETRY.md>.
 
 One notice, one opt-out for both: from disclosure version 6 this CLI's line
-names the `caveman-blocks` script counts (runs, hints, byte totals; never
-scripts or the names of blocks you wrote). `caveman-blocks` reads this decision
+names `caveman-blocks` commands and usage counts (each command with its
+duration and exit class, scan totals, script, hint and run counts, byte totals,
+first-party block and harness names, install channel, active repo count; never
+scripts, file paths or the names of blocks you wrote). `caveman-blocks` reads this decision
 from the config file and, while it is a version 6 or later yes, sends its
 counts under the same install ID without printing a second notice.
 `caveman telemetry off` turns Blocks off too, at once; `caveman-blocks
@@ -163,7 +165,7 @@ version it was made under. A wider scope reprints the disclosure once on the nex
 interactive command and bumps the stored version; it never re-asks, never flips a
 decision, and never touches a persisted opt-out. Version 4 added the token
 totals below; version 5 added the IP address, agent session starts, account
-and install type, timezone, and locale; version 6 added Caveman Blocks' usage
+and install type, timezone, and locale; version 6 added Caveman Blocks' commands and usage
 counts.
 
 This telemetry is pseudonymous, not anonymous: the install ID links one

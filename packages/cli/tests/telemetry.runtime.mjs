@@ -728,7 +728,7 @@ test("a stale-version opt-in is re-disclosed once and never re-asked", async (t)
     return;
   }
   assert.match(first.output, /IP address/, "the widened scope must be disclosed");
-  assert.match(first.output, /caveman-blocks script counts/, "v6 names the Blocks counts it now covers");
+  assert.match(first.output, /caveman-blocks commands and usage counts/, "v6 names the Blocks counts it now covers");
   assert.doesNotMatch(first.output, /\[y\/N\]/, "an existing decision is never re-asked");
   const cfg = JSON.parse(readFileSync(join(configDir, "cloud.json"), "utf8"));
   assert.equal(cfg.telemetry.promptVersion, 6);

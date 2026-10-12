@@ -832,7 +832,7 @@ function invokedCommand(legacyVerb: string, groupedTail = ""): string {
 
 let currentInvocation: ResolvedInvocation;
 currentInvocation = resolveInvocation(process.argv.slice(2));
-// Version 6 = the line also covers caveman-blocks' script counts: Blocks reads
+// Version 6 = the line also covers caveman-blocks' commands and usage counts: Blocks reads
 // this decision from cloud.json and, from version 6, enrolls under the same id
 // without a second notice, so one `caveman telemetry off` turns both off.
 // Version 5 = the receiver stores the client IP address with each event. v4 was
@@ -851,7 +851,7 @@ const TELEMETRY_DELETION_URL = "https://github.com/JuliusBrussee/caveman/blob/ma
 // caveman-blocks follows this decision (control 6 in its docs/TELEMETRY.md).
 const TELEMETRY_OFF_NOTE = "caveman-blocks telemetry is off too";
 const TELEMETRY_DISCLOSURE_LINE =
-  "usage stats on — commands, agent sessions, token totals, account and install type, timezone and language, caveman-blocks script counts (runs, hints, byte totals), and your IP address; never prompts, code, file paths, or scripts and block names you wrote · caveman telemetry off (Blocks too)";
+  "usage stats on — commands, agent sessions, token totals, account and install type, timezone and language, caveman-blocks commands and usage counts, and your IP address; never prompts, code, file paths, scripts, or names of blocks you wrote · caveman telemetry off (Blocks too)";
 // Reading token totals means spawning caveman-proxy to query the local SQLite
 // store. It runs after the command's own work, so the cost lands on process exit;
 // a slow or wedged binary drops the token fields rather than holding the CLI.
