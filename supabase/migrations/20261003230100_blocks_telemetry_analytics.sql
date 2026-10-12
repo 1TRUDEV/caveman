@@ -21,6 +21,9 @@
 -- byte count, not a token or cost figure: per install and day,
 -- greatest(bytes_full - bytes_returned, 0). The runner's wrapper can return
 -- more bytes than a block printed, so the difference can be negative.
+-- scripts_bytes is the bytes of inline scripts captured, a count, never the
+-- text. It is null on rows from clients that predate it, so a bytes-per-script
+-- figure must divide by scripts only over rows where it is not null.
 --
 -- ponytail: plain views recompute on every read; materialize the heavy ones
 -- once the table is large. blocks_daily goes first: its 30-day range join is a
@@ -33,7 +36,7 @@ with e as (
   select
     id, anonymous_id, event, cli_version, os, arch, install_channel, linked, ip,
     command, subcommand, exit_class,
-    sessions, scripts, hints, hints_followed, runs, bytes_full, bytes_returned,
+    sessions, scripts, scripts_bytes, hints, hints_followed, runs, bytes_full, bytes_returned,
     coalesce(day, (received_at at time zone 'utc')::date) as active_on
   from public.blocks_events
 )
@@ -66,6 +69,7 @@ select
   count(*) filter (where runs > 0) > 0 as has_block_runs,
   coalesce(sum(sessions), 0) as sessions,
   coalesce(sum(scripts), 0) as scripts,
+  coalesce(sum(scripts_bytes), 0) as scripts_bytes,
   coalesce(sum(hints), 0) as hints,
   coalesce(sum(hints_followed), 0) as hints_followed,
   coalesce(sum(runs), 0) as runs,
@@ -94,6 +98,7 @@ per_install as (
     sum(hints) as hints,
     sum(hints_followed) as hints_followed,
     sum(runs) as runs,
+    sum(scripts_bytes) as scripts_bytes,
     sum(greatest(bytes_full - bytes_returned, 0)) as bytes_withheld
   from public.blocks_events
   where event = 'daily_usage' and day > (now() at time zone 'utc')::date - 30
@@ -105,6 +110,7 @@ usage as (
     coalesce(sum(hints), 0) as hints_30d,
     coalesce(sum(hints_followed), 0) as hints_followed_30d,
     coalesce(sum(runs), 0) as runs_30d,
+    coalesce(sum(scripts_bytes), 0) as scripts_bytes_30d,
     coalesce(sum(bytes_withheld), 0) as bytes_withheld_30d,
     -- An install never counts more follows than hints here, so one forged
     -- row (the endpoint is unauthenticated) cannot push the rate past 100.
@@ -117,6 +123,7 @@ select
   usage.hints_30d,
   usage.hints_followed_30d,
   usage.runs_30d,
+  usage.scripts_bytes_30d,
   usage.bytes_withheld_30d,
   -- share of counted hints followed by a call of the hinted block
   round(100.0 * usage.followed_capped / nullif(usage.hints_30d, 0), 1) as hint_follow_pct_30d
@@ -131,6 +138,7 @@ with activity as (
     count(*) filter (where event = 'command_run' and exit_class = 'error') as command_errors,
     coalesce(sum(sessions), 0) as sessions,
     coalesce(sum(scripts), 0) as scripts,
+    coalesce(sum(scripts_bytes), 0) as scripts_bytes,
     coalesce(sum(hints), 0) as hints,
     coalesce(sum(hints_followed), 0) as hints_followed,
     coalesce(sum(promote_hints), 0) as promote_hints,
@@ -160,6 +168,7 @@ select
   coalesce(sum(a.command_errors) filter (where a.day = d.day), 0) as command_errors,
   coalesce(sum(a.sessions) filter (where a.day = d.day), 0) as sessions,
   coalesce(sum(a.scripts) filter (where a.day = d.day), 0) as scripts,
+  coalesce(sum(a.scripts_bytes) filter (where a.day = d.day), 0) as scripts_bytes,
   coalesce(sum(a.hints) filter (where a.day = d.day), 0) as hints,
   coalesce(sum(a.hints_followed) filter (where a.day = d.day), 0) as hints_followed,
   coalesce(sum(a.promote_hints) filter (where a.day = d.day), 0) as promote_hints,

@@ -41,6 +41,9 @@ create table public.blocks_events (
   repos_active bigint,
   sessions bigint,
   scripts bigint,
+  -- bytes of the inline scripts captured (a count, never the text); null
+  -- from clients that predate the field
+  scripts_bytes bigint,
   hints bigint,
   hints_followed bigint,
   promote_hints bigint,

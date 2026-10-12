@@ -30,7 +30,7 @@ const scanRun = {
 };
 const dailyUsage = {
   ...base, event: "daily_usage", day: "2026-10-02",
-  repos_active: 3, sessions: 7, scripts: 210, hints: 40, hints_followed: 18, promote_hints: 2, calls: 25,
+  repos_active: 3, sessions: 7, scripts: 210, scripts_bytes: 512_000, hints: 40, hints_followed: 18, promote_hints: 2, calls: 25,
   runs: 31, runs_failed: 2, runs_user: 4, verify_pass: 5, verify_fail: 1, bytes_full: 1_800_000, bytes_returned: 64_000,
   blocks_first_party: 4, blocks_user: 1,
   first_party_runs: { "json-peek": 12, "test-summary": 9, "first-error": 4, "grep-defs": 2 },
@@ -46,7 +46,7 @@ const rowKeys = columns.filter((c) => !["id", "received_at", "ip"].includes(c)).
 const ok = (event: unknown) => validateEvent(event, NOW);
 
 test("the column list was read from the migration", () => {
-  assert.equal(columns.length, 45);
+  assert.equal(columns.length, 46);
   assert.ok(columns.includes("first_party_runs") && columns.includes("scan_top_count") && columns.includes("linked"));
 });
 
@@ -93,11 +93,15 @@ test("normalizes and stores each event's own fields only", () => {
   const daily = ok(dailyUsage)!;
   assert.equal(daily.day, "2026-10-02");
   assert.equal(daily.bytes_full, 1_800_000);
+  assert.equal(daily.scripts_bytes, 512_000);
   assert.equal(daily.command, null);
   assert.deepEqual(daily.first_party_runs, dailyUsage.first_party_runs);
   assert.deepEqual(daily.harness_sessions, { claude: 5, codex: 2 });
   const sparse = ok({ ...base, event: "daily_usage", day: "2026-10-02", runs: 1 })!;
   assert.equal(sparse.hints, 0, "absent counter is 0");
+  assert.equal(sparse.scripts_bytes, null, "absent scripts_bytes is unknown, not 0");
+  assert.equal(ok({ ...dailyUsage, scripts_bytes: undefined })!.scripts_bytes, null, "a client before scripts_bytes is accepted");
+  assert.equal(add.scripts_bytes, null, "scripts_bytes only on daily_usage");
   assert.deepEqual(sparse.first_party_runs, {});
   assert.deepEqual(sparse.harness_sessions, {});
 });
@@ -107,7 +111,7 @@ test("a Go struct's zero values for other events' fields are not a leak", () => 
     command: "", subcommand: "", block: "", duration_ms: 0, exit_class: "", error_class: "",
     scan_window_days: 0, scan_commands: 0, scan_scripts: 0, scan_edits: 0, scan_shapes: 0, scan_repeated_shapes: 0,
     scan_covered_shapes: 0, scan_covered_scripts: 0, scan_top_count: 0,
-    day: "", repos_active: 0, sessions: 0, scripts: 0, hints: 0, hints_followed: 0, promote_hints: 0, calls: 0, runs: 0,
+    day: "", repos_active: 0, sessions: 0, scripts: 0, scripts_bytes: 0, hints: 0, hints_followed: 0, promote_hints: 0, calls: 0, runs: 0,
     runs_failed: 0, runs_user: 0, verify_pass: 0, verify_fail: 0, bytes_full: 0, bytes_returned: 0,
     blocks_first_party: 0, blocks_user: 0, first_party_runs: null, harness_sessions: {},
   };
@@ -213,6 +217,10 @@ test("rejects malformed and out-of-contract events", () => {
       .map((k): [string, unknown] => [`${k} too big`, { ...dailyUsage, [k]: 2 ** 24 }]),
     ["bytes_full too big", { ...dailyUsage, bytes_full: 2 ** 36 }],
     ["bytes_returned too big", { ...dailyUsage, bytes_returned: 2 ** 36 }],
+    ["scripts_bytes too big", { ...dailyUsage, scripts_bytes: 2 ** 36 }],
+    ["scripts_bytes as string", { ...dailyUsage, scripts_bytes: "512000" }],
+    ["negative scripts_bytes", { ...dailyUsage, scripts_bytes: -1 }],
+    ["scripts_bytes without scripts", { ...dailyUsage, scripts: 0, scripts_bytes: 10 }],
     ["map count too big", { ...dailyUsage, sessions: 2 ** 24 - 1, harness_sessions: { claude: 2 ** 24 } }],
     ["followed > calls", { ...dailyUsage, calls: 17 }],
     ["failed > runs", { ...dailyUsage, runs_failed: 32 }],
@@ -246,6 +254,7 @@ test("rejects one event's fields on another event", () => {
     ["unknown-key map on first_run", { ...firstRun, first_party_runs: { "deploy-staging": 1 } }],
     ["day on command_run", { ...commandRun, day: "2026-10-02" }],
     ["counter on command_run", { ...commandRun, hints: 2 }],
+    ["scripts_bytes on command_run", { ...commandRun, scripts_bytes: 100 }],
     ["map on command_run", { ...commandRun, first_party_runs: { "json-peek": 1 } }],
     ["command on daily_usage", { ...dailyUsage, command: "run" }],
     ["exit_class on daily_usage", { ...dailyUsage, exit_class: "ok" }],
@@ -288,7 +297,8 @@ test("accepts honest days that look inconsistent", () => {
   assert.ok(ok({ ...base, event: "daily_usage", day: "2026-10-02", sessions: 2, harness_sessions: { claude: 2, codex: 2 } }));
   assert.ok(ok({ ...base, event: "daily_usage", day: "2026-10-02", scripts: 3 }));
   // The largest values one row may carry, on each side of the byte pair.
-  const edge = ok({ ...dailyUsage, scripts: 2 ** 24 - 1, bytes_full: 2 ** 36 - 1, bytes_returned: 2 ** 36 - 1 })!;
+  const edge = ok({ ...dailyUsage, scripts: 2 ** 24 - 1, scripts_bytes: 2 ** 36 - 1, bytes_full: 2 ** 36 - 1, bytes_returned: 2 ** 36 - 1 })!;
+  assert.equal(edge.scripts_bytes, 2 ** 36 - 1);
   assert.equal(edge.scripts, 2 ** 24 - 1);
   assert.equal(edge.bytes_full, 2 ** 36 - 1);
   assert.equal(edge.bytes_returned, 2 ** 36 - 1);

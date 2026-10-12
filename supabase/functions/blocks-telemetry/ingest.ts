@@ -181,6 +181,9 @@ function toRow(raw: Raw, now: Date): Row {
     repos_active: int(raw, "repos_active", MAX_DAILY),
     sessions: int(raw, "sessions", MAX_DAILY),
     scripts: int(raw, "scripts", MAX_DAILY),
+    // Bytes of the captured scripts' bodies, never the text. Null when absent:
+    // clients before this field captured scripts without counting their bytes.
+    scripts_bytes: optInt(raw, "scripts_bytes", MAX_BYTES),
     hints: int(raw, "hints", MAX_DAILY),
     hints_followed: int(raw, "hints_followed", MAX_DAILY),
     promote_hints: int(raw, "promote_hints", MAX_DAILY),
@@ -205,10 +208,12 @@ function toRow(raw: Raw, now: Date): Row {
     // its call, so hints_followed can exceed that day's hints; and the runner's
     // wrapper (the unverified mark, the truncation envelope) can make the bytes
     // returned exceed the bytes a block printed.
+    // No script captured means no script bytes.
     // A run is first-party or not, and a block that ran has at least one run.
     // The sum over harnesses is not tied to sessions: one session can be seen
     // under two harness names.
     check(validDay(day, now) && usage.hints_followed <= usage.calls
+      && (usage.scripts > 0 || !usage.scripts_bytes)
       && usage.runs_failed <= usage.runs && usage.runs_user + firstPartyTotal <= usage.runs
       && usage.blocks_first_party + usage.blocks_user <= usage.runs && usage.blocks_user <= usage.runs_user
       && Object.values(harnessSessions).every((n) => n <= usage.sessions));
