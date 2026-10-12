@@ -30,6 +30,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
@@ -40,6 +41,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -86,13 +88,16 @@ type Link struct {
 	// add|login`): the pool an ask sends beyond the harness's own models.
 	logins *pool.Store
 
-	mu        sync.Mutex
-	stamp     string
-	loaded    bool
-	stale     bool // a background keychain read found a new secret
-	cfg       settings
-	decisions map[string]*decision
-	refused   map[string]time.Time // ask scope (see scope) + routed model: when the provider refused it
+	mu     sync.Mutex
+	stamp  string
+	loaded bool
+	// stale counts the new secrets background keychain reads found; read is
+	// the count the last finished load saw. Until a load that saw the latest
+	// one finished, every caller reloads: none gets the settings from before.
+	stale, read int
+	cfg         settings
+	decisions   map[string]*decision
+	refused     map[string]time.Time // ask scope (see scope) + routed model: when the provider refused it
 	// states is Cloud's opaque state per session key, least recently used
 	// first out, memory only, for as long as one login.
 	states     map[string]*list.Element
@@ -109,6 +114,15 @@ type Link struct {
 	// accepted are the additive fields a 200 came back for while the ask
 	// carried them: a generic 400 is never blamed on them.
 	accepted map[string]bool
+	// The route path kept hot (warm.go): started is a running runtime's link;
+	// warming a warm in flight; warmMisses non-204 warms in a row, warmOff
+	// past warmMissMax; keeping the keep-alive loop runs; lastAsk the last
+	// ask; lastContact the last answer that shows the path hot (an answered
+	// ask, a warm engine); warmEvery the keep-alive interval.
+	started, warming, warmOff, keeping bool
+	warmMisses                         int
+	lastAsk, lastContact               time.Time
+	warmEvery                          time.Duration
 
 	events eventQueue
 
@@ -135,20 +149,30 @@ func scope(ask gateway.RouteAsk) string {
 }
 
 // Start begins reading the CLI state now, off any request: a keychain read
-// starts here, so the first request after a start finds its credential.
+// starts here, so the first request after a start finds its credential. From
+// here on, signed in with routing on, the link keeps the route path warm
+// (warm.go): at start, at every login, at session and prompt starts, and
+// every minute while asks come.
 func (l *Link) Start() {
+	l.mu.Lock()
+	l.started = true
+	l.mu.Unlock()
 	go l.settings()
 }
 
 // New returns a link reading the CLI state under home ($CAVEMAN_HOME).
 func New(home string, logger *slog.Logger) *Link {
 	return &Link{
-		home:     home,
-		client:   &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-		logger:   logger,
-		now:      time.Now,
-		keychain: macKeychain,
-		logins:   pool.NewStore(home),
+		home: home,
+		client: &http.Client{
+			Transport:     linkTransport(),
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		logger:    logger,
+		now:       time.Now,
+		keychain:  macKeychain,
+		logins:    pool.NewStore(home),
+		warmEvery: warmEvery,
 	}
 }
 
@@ -196,24 +220,30 @@ func (l *Link) settings() settings {
 		}
 	}
 	l.mu.Lock()
-	if l.loaded && stamp == l.stamp && !l.stale {
+	if l.loaded && stamp == l.stamp && l.read == l.stale {
 		defer l.mu.Unlock()
 		return l.cfg
 	}
 	filesChanged := !l.loaded || stamp != l.stamp
-	l.stale = false
+	seen := l.stale
 	l.mu.Unlock()
 	cfg := l.load(current, legacy, credentials, filesChanged)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.read = max(l.read, seen)
 	if filesChanged || cfg != l.cfg {
 		previous := l.cfg
 		l.cfg, l.stamp, l.loaded = cfg, stamp, true
-		if (cfg.access != "" || cfg.key != "") && (cfg.access != previous.access || cfg.key != previous.key) {
+		login := (cfg.access != "" || cfg.key != "") && (cfg.access != previous.access || cfg.key != previous.key)
+		if login {
 			// A new login starts fresh: no pause and no decision from the old one.
 			// Signing out needs no reset: nothing is asked while signed out.
 			l.pauseUntil, l.decisions, l.states, l.noPool, l.noCacheTTL, l.accepted = time.Time{}, nil, nil, false, false, nil
+			l.warmOff, l.warmMisses = false, 0
 			l.forgetLocked()
+		}
+		if login || cfg.routing && !previous.routing {
+			go l.warm(cfg) // a no-op unless started, signed in with routing on
 		}
 	}
 	return l.cfg
@@ -256,7 +286,7 @@ func (l *Link) readKeychain() {
 		l.kmu.Unlock()
 		if changed {
 			l.mu.Lock()
-			l.stale = true
+			l.stale++
 			l.mu.Unlock()
 		}
 		l.kmu.Lock()
@@ -267,6 +297,12 @@ func (l *Link) readKeychain() {
 		again := l.kgen != gen
 		l.kbusy = again
 		l.kmu.Unlock()
+		l.mu.Lock()
+		started := l.started
+		l.mu.Unlock()
+		if changed && started {
+			go l.settings() // a running runtime takes the login now: it warms (warm.go)
+		}
 		if !again {
 			return
 		}
@@ -532,6 +568,7 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 	if bearer == "" {
 		return gateway.RouteAnswer{Outcome: "degraded", Reason: "login_expired"}
 	}
+	l.noteAsk()
 	root, ok := jsonsplice.Root(ask.Body)
 	if ok && statefulChain(ask.Body, root) {
 		// A Responses chain's follow-ups carry no human text to key a decision
@@ -1086,13 +1123,26 @@ func (l *Link) ask(cfg settings, bearer string, ask gateway.RouteAsk, declared r
 		if raw == nil {
 			return nil, gateway.RouteAnswer{Outcome: "kept", Reason: "no_human_text"}, false
 		}
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.gateway+"/v1/route", bytes.NewReader(raw))
+		var reused atomic.Bool
+		trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused.Store(info.Reused) }}
+		request, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, cfg.gateway+"/v1/route", bytes.NewReader(raw))
 		if err != nil {
 			return nil, l.pause(failurePause, gateway.RouteAnswer{Outcome: "degraded", Reason: "bad_cloud_url"}), false
 		}
 		request.Header.Set("content-type", "application/json")
 		request.Header.Set("authorization", "Bearer "+bearer)
+		request.Header["X-Idempotency-Key"] = nil // replayable: a dead kept-alive connection is retried on a new one
+		sent := time.Now()
 		response, err := l.client.Do(request)
+		if l.logger != nil {
+			// The ask's latency as this side saw it, beside the edge's own
+			// account (server-timing) and whether it rode a kept connection.
+			attrs := []any{"ms", time.Since(sent).Milliseconds(), "reused", reused.Load()}
+			if err == nil {
+				attrs = append(attrs, "status", response.StatusCode, "edge", response.Header.Get("x-cave-edge"), "server_timing", response.Header.Get("server-timing"))
+			}
+			l.logger.Info("route ask", attrs...)
+		}
 		if err != nil {
 			reason := "cloud_unreachable"
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -1138,6 +1188,7 @@ func (l *Link) ask(cfg settings, bearer string, ask gateway.RouteAsk, declared r
 	}
 	if response.StatusCode == http.StatusOK {
 		l.mu.Lock()
+		l.lastContact = l.now()
 		if l.accepted == nil {
 			l.accepted = map[string]bool{}
 		}

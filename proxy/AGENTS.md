@@ -231,6 +231,19 @@ the managed gateway (the managed gateway imports them from here). `caveman start
   none in `/me` means `counts`, an unreadable `/me` lowers it to `counts`, `off` or no level sends
   nothing. Model ids from other origins go as `custom`. Signing in or out never changes another
   stage.
+- **the route path is kept hot** (`internal/cloudlink/warm.go`, contract `route-warm-v1`): the link
+  has its own transport (HTTP/2 tried, idle connections kept 10 min, proxy from the environment;
+  asks and warms are marked replayable, so a dead kept connection is retried on a new one). A warm
+  is `POST {gateway}/v1/route` with `x-cave-warm: 1`, the asks' credential and no body; it goes,
+  one at a time and only from a started runtime signed in with routing on, at start and at every
+  login, when a native `session.start` or `prompt.submit` comes after 30 s without contact (an
+  answered ask or a warm engine), and every minute without contact while asks came in the last
+  15 min. Only a 204 with `x-cave-edge-engine: warm` is warm (timeout, error, cold and off are 204s
+  too); it ends a pause a timeout, an unreachable Cloud or a 5xx caused, never a 401/403 or limit
+  pause. Any other status is an origin without the edge (a customer install): no pause, logged at
+  debug, and three in a row stop warming until the next login or start. Each ask logs `route ask`
+  (info): the ms this side measured, whether it reused a connection, the status, `x-cave-edge` and
+  the edge's `server-timing`. The 800 ms budget stays the cap.
 - **pool routing** (`internal/pool`, `internal/translate`, `internal/gateway/route_pool.go`):
   the provider keys and logins a person adds (`caveman providers add|login`;
   `$CAVEMAN_HOME/provider-logins.json` lists ids, where each secret lives and the `cloud` switch,

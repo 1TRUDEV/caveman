@@ -299,6 +299,10 @@ func runServe(logger *slog.Logger) {
 	link := cloudlink.New(home, logger)
 	link.Start() // the keychain read starts now, not on the first request
 	opts.Cloud = link
+	if nativeRuntime != nil {
+		// A session or prompt starting warms the route path before its model request.
+		nativeRuntime.OnTurnStart = link.Prime
+	}
 	// Rows are finished and written off the request path; server.Close below
 	// writes the last of them before the deferred spend.Close.
 	opts.AsyncRecord = true
