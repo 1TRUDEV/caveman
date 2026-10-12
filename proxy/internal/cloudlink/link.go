@@ -54,6 +54,9 @@ const (
 	failurePause = time.Minute      // after a timeout, network error or 5xx
 	pauseRecheck = 15 * time.Minute // how often a limit pause asks /me whether it still holds
 	refusedPause = 10 * time.Minute // after a 401/403: a stale or revoked login
+	// askFloor is the least of routeBudget an ask keeps after waiting for the
+	// keychain: a read slower than the rest is no reason to time out at Cloud.
+	askFloor     = 200 * time.Millisecond
 	decisionsMax = 1024
 	rememberFor  = 30 * time.Minute // how long a decision or a provider's refusal of a routed model holds
 	statesMax    = 1024
@@ -113,6 +116,9 @@ type Link struct {
 	kcache string
 	kbusy  bool
 	kgen   int // bumped by every refresh request
+	// kwait is open while a read runs with no secret cached (the first after
+	// a start, or a login after none): a request with no credential waits on it.
+	kwait chan struct{}
 }
 
 type decision struct {
@@ -126,6 +132,12 @@ type decision struct {
 // reaches an API-key client on /openai/v1 or another agent.
 func scope(ask gateway.RouteAsk) string {
 	return strings.Join([]string{ask.SessionID, ask.Agent, ask.Endpoint, ask.Provider, ask.Model}, "\x00")
+}
+
+// Start begins reading the CLI state now, off any request: a keychain read
+// starts here, so the first request after a start finds its credential.
+func (l *Link) Start() {
+	go l.settings()
 }
 
 // New returns a link reading the CLI state under home ($CAVEMAN_HOME).
@@ -221,6 +233,9 @@ func (l *Link) keychainSecret(refresh bool) string {
 		l.kgen++
 		if !l.kbusy {
 			l.kbusy = true
+			if l.kcache == "" {
+				l.kwait = make(chan struct{})
+			}
 			go l.readKeychain()
 		}
 	}
@@ -238,18 +253,60 @@ func (l *Link) readKeychain() {
 		if changed {
 			l.kcache = secret
 		}
-		again := l.kgen != gen
-		l.kbusy = again
 		l.kmu.Unlock()
 		if changed {
 			l.mu.Lock()
 			l.stale = true
 			l.mu.Unlock()
 		}
+		l.kmu.Lock()
+		if l.kwait != nil {
+			close(l.kwait) // after stale: a waiter reloads with what was read
+			l.kwait = nil
+		}
+		again := l.kgen != gen
+		l.kbusy = again
+		l.kmu.Unlock()
 		if !again {
 			return
 		}
 	}
+}
+
+// awaitKeychain waits, until deadline at most, for a keychain read that runs
+// with no secret cached; true when it landed. It waits on the read, never
+// runs one.
+func (l *Link) awaitKeychain(deadline time.Time) bool {
+	l.kmu.Lock()
+	wait := l.kwait
+	l.kmu.Unlock()
+	if wait == nil {
+		return false
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-wait:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// signedInSettings is settings, waiting until deadline for the credential
+// when routing is on and a keychain read that may bring one is still running;
+// loading says it still is.
+func (l *Link) signedInSettings(deadline time.Time) (cfg settings, loading bool) {
+	cfg = l.settings()
+	if cfg.signedIn() || !cfg.routing || cfg.offline {
+		return cfg, false
+	}
+	if l.awaitKeychain(deadline) {
+		return l.settings(), false
+	}
+	l.kmu.Lock()
+	defer l.kmu.Unlock()
+	return cfg, l.kwait != nil
 }
 
 func (l *Link) load(current, legacy, credentials string, refreshKeychain bool) settings {
@@ -449,12 +506,17 @@ func (l *Link) Ask(_ context.Context, ask gateway.RouteAsk) func() gateway.Route
 // AutoOffered reports whether Auto is in the agents' pickers: signed in with
 // the routing module on.
 func (l *Link) AutoOffered() bool {
-	cfg := l.settings()
+	cfg, _ := l.signedInSettings(time.Now().Add(routeBudget))
 	return cfg.routing && !cfg.offline && cfg.signedIn()
 }
 
 func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAnswer {
-	cfg := l.settings()
+	// The first request after a start can land before the keychain read: it
+	// waits for it, leaving the ask at least askFloor of its budget.
+	cfg, loading := l.signedInSettings(deadline.Add(-askFloor))
+	if loading {
+		return gateway.RouteAnswer{Outcome: "degraded", Reason: "credential_loading"}
+	}
 	if !cfg.routing || cfg.offline || !cfg.signedIn() {
 		return gateway.RouteAnswer{Outcome: "off"}
 	}

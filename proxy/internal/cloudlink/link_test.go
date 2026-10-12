@@ -1276,3 +1276,67 @@ func TestTurnStartedInAPauseKeepsItsAnswer(t *testing.T) {
 		t.Fatalf("a new ask after the pause: %+v", answer)
 	}
 }
+
+// Start begins the keychain read off any request; the first request after a
+// start that lands before the read waits for it and is asked about, instead
+// of going out unrouted.
+func TestFirstRequestWaitsForTheKeychainRead(t *testing.T) {
+	secret := token(time.Now().Add(time.Hour))
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("authorization") != "Bearer "+secret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	link := New(keychainHome(t, cloud.URL, nil), nil)
+	var reads atomic.Int32
+	link.keychain = func() string {
+		reads.Add(1)
+		time.Sleep(150 * time.Millisecond)
+		return `{"access_token":"` + secret + `"}`
+	}
+	link.Start()
+	for deadline := time.Now().Add(2 * time.Second); reads.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("Start did not begin the keychain read")
+		}
+	}
+	if answer := link.Ask(t.Context(), messagesAsk("claude-opus-5-5"))(); answer.Model != "claude-sonnet-5-5" {
+		t.Fatalf("first request after a start = %+v, want it asked about with the keychain's credential", answer)
+	}
+	if !link.AutoOffered() || reads.Load() != 1 {
+		t.Fatalf("auto offered %v, keychain reads %d; want offered after one read", link.AutoOffered(), reads.Load())
+	}
+}
+
+// A keychain read slower than the route budget leaves the first request on
+// the asked model within the budget, without a pause: the next request,
+// once the read landed, is asked about.
+func TestAKeychainSlowerThanTheBudgetNeverPauses(t *testing.T) {
+	secret := token(time.Now().Add(time.Hour))
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	link := New(keychainHome(t, cloud.URL, nil), nil)
+	release := make(chan struct{})
+	link.keychain = func() string {
+		<-release
+		return `{"access_token":"` + secret + `"}`
+	}
+	link.Start()
+	started := time.Now()
+	first := link.Ask(t.Context(), messagesAsk("claude-opus-5-5"))()
+	if took := time.Since(started); first.Model != "" || first.Reason != "credential_loading" || took > routeBudget+100*time.Millisecond {
+		t.Fatalf("first = %+v after %v, want credential_loading within the budget", first, took)
+	}
+	close(release)
+	waitForAccess(t, link, secret)
+	next := messagesAsk("claude-opus-5-5")
+	next.SessionID = "s2"
+	if answer := link.Ask(t.Context(), next)(); answer.Model != "claude-sonnet-5-5" {
+		t.Fatalf("after the read landed = %+v, want routed (no pause)", answer)
+	}
+}

@@ -296,7 +296,9 @@ func runServe(logger *slog.Logger) {
 
 	// Routing asks and runtime/v1 events, only while the CLI is signed in with
 	// the routing module on; every Cloud failure keeps the asked model.
-	opts.Cloud = cloudlink.New(home, logger)
+	link := cloudlink.New(home, logger)
+	link.Start() // the keychain read starts now, not on the first request
+	opts.Cloud = link
 	// Rows are finished and written off the request path; server.Close below
 	// writes the last of them before the deferred spend.Close.
 	opts.AsyncRecord = true

@@ -146,7 +146,10 @@ the managed gateway (the managed gateway imports them from here). `caveman start
   not) is offered to Cloud like any other, as its agent (`x-cave-agent`, else Codex by its
   `originator` or User-Agent), with model ids in `route_from`/`route_to`; a model it could not read
   goes to Cloud as none. The
-  ask starts before compression (parse, ask, compress, route), waits at most 800 ms, carries the
+  ask starts before compression (parse, ask, compress, route), waits at most 800 ms (the CLI's
+  keychain credential is read when the runtime starts, `Link.Start`, never on a request goroutine;
+  a request that lands while a read runs with no secret cached waits for it, leaving the ask at
+  least 200 ms, else goes as `credential_loading` without a pause), carries the
   caller's models, counts, what the request declares (the raw values of eleven allowlisted agent
   headers, never cut: a value over 256 bytes, 16 KiB for Codex's turn metadata, which also comes
   from the body's `client_metadata`, is left out; a forked Claude Code child's spawn-call
