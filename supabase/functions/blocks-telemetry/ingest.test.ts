@@ -40,7 +40,12 @@ const dailyUsage = {
 // public.blocks_events' columns, read from the migration so the two cannot drift.
 const migration = readFileSync(new URL("../../migrations/20261003230000_blocks_telemetry.sql", import.meta.url), "utf8");
 const tableBody = migration.slice(migration.indexOf("create table public.blocks_events ("), migration.indexOf("\n);"));
-const columns = [...tableBody.matchAll(/^ {2}([a-z_0-9]+) [a-z]/gm)].map((m) => m[1]).filter((c) => c !== "constraint");
+// Columns added by later migrations (the first two are applied and never edited).
+const added = readFileSync(new URL("../../migrations/20261012230000_blocks_telemetry_scripts_bytes_limits.sql", import.meta.url), "utf8");
+const columns = [
+  ...[...tableBody.matchAll(/^ {2}([a-z_0-9]+) [a-z]/gm)].map((m) => m[1]).filter((c) => c !== "constraint"),
+  ...[...added.matchAll(/^alter table public\.blocks_events add column if not exists ([a-z_0-9]+) /gm)].map((m) => m[1]),
+];
 const rowKeys = columns.filter((c) => !["id", "received_at", "ip"].includes(c)).sort();
 
 const ok = (event: unknown) => validateEvent(event, NOW);
