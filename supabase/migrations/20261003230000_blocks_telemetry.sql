@@ -117,37 +117,17 @@ declare
   );
   v_n integer;
 begin
-  -- Per-sender limits count attempts, so a flood spends its own budget.
-  insert into private.cli_events_rate as r (bucket, minute, n)
-  values (v_bucket, v_minute, 1)
-  on conflict (bucket, minute) do update set n = r.n + 1
-  returning r.n into v_n;
-  if v_n > 30 then
-    return null;
-  end if;
-
-  insert into private.cli_events_rate_daily as r (bucket, day, n)
-  values (v_bucket, v_day, 1)
-  on conflict (bucket, day) do update set n = r.n + 1
-  returning r.n into v_n;
-  if v_n > 5000 then
-    return null;
-  end if;
-
   -- A day's daily_usage is stored once, first write wins, so a client that
-  -- resends after a lost acknowledgement never double counts. Checked here:
-  -- after the per-sender counters, so a resend spends its sender's budget
-  -- like any attempt, and a concurrent resend from the same sender has
-  -- already waited on the counter rows above until the first write committed
-  -- (this statement then sees it); before the global ceiling and the
-  -- new-install count, so a row that adds nothing never spends shared
-  -- capacity or a new-install slot. The advisory lock covers a concurrent
-  -- resend from another bucket (a host's IPv4 and IPv6 address);
-  -- blocks_events_daily_usage_idx is the backstop.
+  -- resends after a lost acknowledgement never double counts. Checked first,
+  -- before any counter, so a row that adds nothing spends no budget at all.
+  -- The advisory lock covers a concurrent resend of the same day (from this
+  -- sender or another bucket, such as a host's IPv4 and IPv6 address):
+  -- whoever holds it has committed or rolled back by the time this statement
+  -- can see the table again. blocks_events_daily_usage_idx is the backstop.
   --
   -- The lock is only ever tried, never waited for. An earlier row of the same
-  -- batch may already hold the global counter row below, so waiting here while
-  -- the other transaction waits for that row is a deadlock that aborts a whole
+  -- batch may already hold a counter row below, so waiting here while the
+  -- other transaction waits for that row is a deadlock that aborts a whole
   -- batch and stalls every sender behind the global row. If someone else holds
   -- the lock they are storing this install's day right now: skip ours. Should
   -- their row then not be stored after all (their transaction rolls back, or
@@ -168,6 +148,36 @@ begin
     ) then
       return null;
     end if;
+  end if;
+
+  -- Per-sender limits count attempts, so a flood spends its own budget.
+  --
+  -- A daily_usage row skips the per-minute limit. Many installs behind one
+  -- address (an office NAT) can spend 30 a minute on commands, and a dropped
+  -- day is never resent: the sender only ever sees 202 and marks it sent. A
+  -- day is at most one stored row per install and day, and still spends the
+  -- per-sender daily count below, so one address adds at most 5000 attempts a
+  -- day to the global ceiling, whatever install ids it forges; fresh ids also
+  -- spend new-install slots. It is not exempt from the daily count: without
+  -- it, forged fresh ids would reach the global ceiling unbounded (the
+  -- new-install limit is checked after it). A day can still be lost behind an
+  -- address that sends over 5000 events in a UTC day.
+  if new.event <> 'daily_usage' then
+    insert into private.cli_events_rate as r (bucket, minute, n)
+    values (v_bucket, v_minute, 1)
+    on conflict (bucket, minute) do update set n = r.n + 1
+    returning r.n into v_n;
+    if v_n > 30 then
+      return null;
+    end if;
+  end if;
+
+  insert into private.cli_events_rate_daily as r (bucket, day, n)
+  values (v_bucket, v_day, 1)
+  on conflict (bucket, day) do update set n = r.n + 1
+  returning r.n into v_n;
+  if v_n > 5000 then
+    return null;
   end if;
 
   -- Global ceiling ('::/0' row), shared with cli_events. Keep the 10000 in
