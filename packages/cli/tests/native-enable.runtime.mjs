@@ -1864,3 +1864,64 @@ test("enable codex skips a voice skill the Skills CLI already put in ~/.agents/s
   assert.equal(existsSync(fx.skill("caveman", join(fx.home, "codex-home"))), false);
   assert.ok(existsSync(fx.skill("ultracave", join(fx.home, "codex-home"))));
 });
+
+// #1247: a user whose Claude settings already route to a third-party
+// Anthropic-protocol gateway (DeepSeek, Z.ai, a corporate relay) carries that
+// gateway's credentials in the same file. enable used to overwrite the route
+// unconditionally, so every later turn went to caveman's own anthropic upstream
+// — api.anthropic.com — and answered "Invalid API key" with nothing naming the
+// cause. The proxy already supports the configuration that keeps both
+// (`providers.anthropic.base_url`), so refuse and name it rather than break a
+// working install.
+test("enable claude refuses to overwrite a third-party ANTHROPIC_BASE_URL", async () => {
+  const fx = fixture();
+  mkdirSync(join(fx.home, ".claude"), { recursive: true });
+  const settingsPath = join(fx.home, ".claude", "settings.json");
+  const original = JSON.stringify({
+    env: {
+      ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic",
+      ANTHROPIC_API_KEY: "sk-user-deepseek",
+    },
+  }, null, 2) + "\n";
+  writeFileSync(settingsPath, original);
+
+  const out = await run(["enable", "claude"], fx.env);
+  assert.notEqual(out.code, 0, "enable must not silently take over a foreign route");
+  assert.match(out.stderr, /ANTHROPIC_BASE_URL/);
+  assert.match(out.stderr, /providers\.anthropic\.base_url/, "refusal must name the supported configuration");
+  assert.equal(readFileSync(settingsPath, "utf8"), original, "refusal must leave settings byte-identical");
+  assert.equal(existsSync(join(fx.home, ".caveman", "integrations", "claude.json")), false, "refused enable must write no journal");
+});
+
+// The refusal must not catch caveman's own route: re-running enable, or an
+// install whose settings already carry a caveman gateway route, is the ordinary
+// idempotent path.
+test("enable claude still takes over its own route and a managed caveman gateway route", async () => {
+  for (const owned of ["http://127.0.0.1:8787/w/claude", "https://gateway.caveman.so/w/claude"]) {
+    const fx = fixture();
+    mkdirSync(join(fx.home, ".claude"), { recursive: true });
+    const settingsPath = join(fx.home, ".claude", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ env: { ANTHROPIC_BASE_URL: owned } }, null, 2) + "\n");
+    const out = await run(["enable", "claude"], fx.env);
+    assert.equal(out.code, 0, `${owned}: ${out.stderr}`);
+    assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/w/claude");
+  }
+});
+
+// The `caveman <agent>` shortcut answers an enable failure with a session-only
+// wrap. For this conflict that fallback is not a lesser door but the same
+// failure again — wrap redirects ANTHROPIC_BASE_URL too — so the shortcut must
+// surface the refusal instead of burying it in a warning (#1247).
+test("the claude shortcut does not fall back to wrap on a foreign-route conflict", async () => {
+  const fx = fixture();
+  mkdirSync(join(fx.home, ".claude"), { recursive: true });
+  const settingsPath = join(fx.home, ".claude", "settings.json");
+  const original = JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic" } }, null, 2) + "\n";
+  writeFileSync(settingsPath, original);
+
+  const out = await run(["claude"], fx.env);
+  assert.notEqual(out.code, 0);
+  assert.match(out.stderr, /providers\.anthropic\.base_url/);
+  assert.doesNotMatch(out.stderr, /using session-only wrap for this run/);
+  assert.equal(readFileSync(settingsPath, "utf8"), original);
+});

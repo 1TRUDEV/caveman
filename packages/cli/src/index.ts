@@ -5405,6 +5405,11 @@ async function agentShortcut(rest: string[]) {
     // the repair door for drifted installs.
     if (!readNativeJournal(native)) enableNative([native]);
   } catch (error) {
+    // A conflict with the user's own configuration is not something a
+    // session-only wrap recovers from — wrap redirects the same variable, so
+    // falling back would reproduce the failure with the reason scrolled past
+    // (#1247). Surface it and stop.
+    if (isNativeUserConflict(error)) throw error;
     process.stderr.write(`${mark("warn")} native enable failed: ${(error as Error).message} — using session-only wrap for this run\n`);
     return wrap(rest);
   }
@@ -7469,6 +7474,55 @@ function nativeHostProbe(agent: AgentProfile): { binary: string | null; launchab
 
 function detectedAgentVersion(agent: AgentProfile): string | null { return nativeHostProbe(agent).version; }
 
+// #1247: the one host whose route lives as a bare env var in a file the user
+// also edits by hand. Every other owned value in claudeNativeMutations already
+// yields to a user value; the route cannot (routing IS the install), so the
+// install refuses rather than clobbering. Only a value that is neither absent
+// nor one of caveman's own gateway routes counts as foreign — `hasNativeHooks:
+// false` because an install journal is not evidence that a hand-edited route
+// is ours.
+function claudeForeignRoute(previous: unknown, route: string): string | null {
+  if (typeof previous !== "string" || previous.trim() === "") return null;
+  if (previous === route || isCavemanClaudeRoute(previous, false)) return null;
+  return previous;
+}
+
+// The agent shortcut answers an enable failure by falling back to the ephemeral
+// wrap door, on the grounds that the shortcut is never worse than a session-only
+// wrap. That reasoning does not hold for this conflict: wrap redirects the same
+// variable, so the fallback would hand the user the same rejected key with the
+// explanation scrolled past. Tag the error so the shortcut stops instead.
+const NATIVE_CONFLICT = Symbol.for("caveman.nativeUserConflict");
+
+function nativeUserConflict(message: string): Error {
+  const error = new Error(message);
+  (error as Error & { [NATIVE_CONFLICT]?: true })[NATIVE_CONFLICT] = true;
+  return error;
+}
+
+function isNativeUserConflict(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { [NATIVE_CONFLICT]?: true })[NATIVE_CONFLICT]);
+}
+
+function assertClaudeRouteNotForeign(settingsPath: string, previous: unknown, route: string): void {
+  const foreign = claudeForeignRoute(previous, route);
+  if (!foreign) return;
+  const configPath = process.env.CAVEMAN_CONFIG ?? join(cavemanHome(), "caveman.yaml");
+  throw nativeUserConflict(
+    `${settingsPath} already points ANTHROPIC_BASE_URL at ${foreign}.\n`
+    + "Enabling Caveman would replace that route with its own proxy, so every request would go to Caveman's\n"
+    + "anthropic upstream (api.anthropic.com) and your endpoint's key would be rejected.\n"
+    + `To keep both, set providers.anthropic.base_url in ${configPath} to that endpoint:\n`
+    + "\n"
+    + "  providers:\n"
+    + "    anthropic:\n"
+    + `      base_url: ${foreign}\n`
+    + "\n"
+    + "then re-run this command. To route to api.anthropic.com instead, remove ANTHROPIC_BASE_URL from\n"
+    + "the settings file first.",
+  );
+}
+
 function claudeNativeMutations(gw: string, mcpBinary: string): NativeMutation[] {
   const settingsPath = claudeSettingsPath();
   const settingsBefore = fileBytes(settingsPath);
@@ -7482,6 +7536,15 @@ function claudeNativeMutations(gw: string, mcpBinary: string): NativeMutation[] 
     : {};
   const route = appendUrlPath(gw, "/w/claude");
   const previousRoute = env.ANTHROPIC_BASE_URL;
+  // A user already routing Claude Code at a third-party Anthropic-protocol
+  // endpoint (DeepSeek, Z.ai, a corporate relay) keeps that endpoint's key in
+  // this same file. Taking the route over silently sent every later turn to
+  // caveman's own anthropic upstream — api.anthropic.com — which answered
+  // "Invalid API key" with nothing naming the cause, and `disable` was the only
+  // way back (#1247). The proxy supports the configuration that keeps both, so
+  // name it instead of breaking a working install. Our own route is not a
+  // conflict: re-running enable is the ordinary idempotent path.
+  assertClaudeRouteNotForeign(settingsPath, previousRoute, route);
   env.ANTHROPIC_BASE_URL = route;
   // Routing through the local proxy makes ANTHROPIC_BASE_URL non-first-party in
   // Claude Code's eyes, which silently drops the 1M context / ~600k
