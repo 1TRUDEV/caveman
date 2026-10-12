@@ -128,7 +128,7 @@ the managed gateway (the managed gateway imports them from here). `caveman start
   ask starts before compression (parse, ask, compress, route), waits at most 800 ms (the CLI's
   keychain credential is read when the runtime starts, `Link.Start`, never on a request goroutine;
   a request that lands while a read runs with no secret cached waits for it, leaving the ask at
-  least 200 ms, else goes as `credential_loading` without a pause), carries the
+  least 500 ms, else goes as `credential_loading` without an ask or a pause), carries the
   caller's models, counts, what the request declares (the raw values of eleven allowlisted agent
   headers, never cut: a value over 256 bytes, 16 KiB for Codex's turn metadata, which also comes
   from the body's `client_metadata`, is left out; a forked Claude Code child's spawn-call
@@ -137,7 +137,7 @@ the managed gateway (the managed gateway imports them from here). `caveman start
   cache token counts, its age) and Cloud's opaque per-session state, plus, on a turn's first ask,
   the raw text of the latest human turn, the one before it and the end of the agent's last reply
   (contracts `route-ask-v1`; Cloud picks the model and the effort and no routing logic lives
-  here). Its answer is cached per ask for up to 30 min (session, or without one agent and
+  here). Its answer is cached per ask until 30 min after its last use (session, or without one agent and
   endpoint, provider, model, turn number, latest human text;
   an input group carrying a tool result is no human turn, text riding along included) so a tool
   loop never switches model or effort mid-turn (an ask first seen during a pause keeps the paused answer for its turn); a request the agent labels compaction or auxiliary
@@ -232,8 +232,9 @@ the managed gateway (the managed gateway imports them from here). `caveman start
   nothing. Model ids from other origins go as `custom`. Signing in or out never changes another
   stage.
 - **the route path is kept hot** (`internal/cloudlink/warm.go`, contract `route-warm-v1`): the link
-  has its own transport (HTTP/2 tried, idle connections kept 10 min, proxy from the environment;
-  asks and warms are marked replayable, so a dead kept connection is retried on a new one). A warm
+  has its own transport (HTTP/2 tried, idle connections kept 10 min and pinged after 15 s of
+  silence, proxy from the environment; a warm is marked replayable, so a dead kept connection is
+  retried on a new one, an ask never: the server may already have decided and counted it). A warm
   is `POST {gateway}/v1/route` with `x-cave-warm: 1`, the asks' credential and no body; it goes,
   one at a time and only from a started runtime signed in with routing on, at start and at every
   login, when a native `session.start` or `prompt.submit` comes after 30 s without contact (an

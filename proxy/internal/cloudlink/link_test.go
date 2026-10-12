@@ -1340,3 +1340,102 @@ func TestAKeychainSlowerThanTheBudgetNeverPauses(t *testing.T) {
 		t.Fatalf("after the read landed = %+v, want routed (no pause)", answer)
 	}
 }
+
+// An ask is never replayed by the transport: a server that read it (and may
+// have decided and counted it) and then dropped the kept connection sees it
+// once. The agent's next request asks again.
+func TestAnAskIsNeverSentTwice(t *testing.T) {
+	var asks atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		if asks.Add(1) == 2 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close() // read, decided, then the kept connection drops
+			}
+			return
+		}
+		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	link := newLink(cloudHome(t, cloud.URL, true, `{"access_token":"`+token(time.Now().Add(time.Hour))+`"}`))
+	for _, session := range []string{"s1", "s2"} {
+		ask := messagesAsk("claude-opus-5-5")
+		ask.SessionID = session
+		link.Ask(t.Context(), ask)()
+	}
+	if got := asks.Load(); got != 2 {
+		t.Fatalf("Cloud saw %d asks for 2 calls, want 2", got)
+	}
+}
+
+// A load that saw fewer keychain secrets and finishes after a newer one never
+// puts the settings from before the read back.
+func TestAnOlderLoadNeverOverwritesANewerOne(t *testing.T) {
+	link := newLink(t.TempDir())
+	newer := settings{routing: true, cloud: "https://cloud.test", gateway: "https://cloud.test", access: "token"}
+	older := settings{routing: true, cloud: "https://cloud.test", gateway: "https://cloud.test"}
+	link.mu.Lock()
+	link.stale = 1
+	link.adoptLocked(newer, "stamp", 1, true)
+	got := link.adoptLocked(older, "stamp", 0, true)
+	stored := link.cfg
+	link.mu.Unlock()
+	if !got.signedIn() || !stored.signedIn() {
+		t.Fatalf("an older load overwrote the newer settings: got %+v, stored %+v", got, stored)
+	}
+}
+
+// A keychain read landing with less than askFloor of the budget left sends
+// no ask (a timeout there would pause routing): credential_loading, and the
+// next request is asked about.
+func TestALateKeychainReadSendsNoAsk(t *testing.T) {
+	secret := token(time.Now().Add(time.Hour))
+	var asks atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asks.Add(1)
+		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	link := New(keychainHome(t, cloud.URL, nil), nil)
+	link.keychain = func() string {
+		time.Sleep(routeBudget - askFloor + 50*time.Millisecond)
+		return `{"access_token":"` + secret + `"}`
+	}
+	link.Start()
+	if first := link.Ask(t.Context(), messagesAsk("claude-opus-5-5"))(); first.Reason != "credential_loading" || asks.Load() != 0 {
+		t.Fatalf("first = %+v, asks %d; want credential_loading and no ask", first, asks.Load())
+	}
+	waitForAccess(t, link, secret)
+	next := messagesAsk("claude-opus-5-5")
+	next.SessionID = "s2"
+	if answer := link.Ask(t.Context(), next)(); answer.Model != "claude-sonnet-5-5" {
+		t.Fatalf("next = %+v, want routed (no pause)", answer)
+	}
+}
+
+// A decision holds 30 min after its last use, so a tool loop longer than that
+// never switches model halfway.
+func TestADecisionHoldsWhileItIsUsed(t *testing.T) {
+	var asks atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asks.Add(1)
+		_, _ = io.WriteString(w, `{"model":"claude-sonnet-5-5","reason":"ranked"}`)
+	}))
+	defer cloud.Close()
+	link := newLink(cloudHome(t, cloud.URL, true, `{"access_token":"`+token(time.Now().Add(24*time.Hour))+`"}`))
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	link.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	for _, step := range []time.Duration{0, 25 * time.Minute, 25 * time.Minute} {
+		clock.Add(int64(step))
+		if answer := link.Ask(t.Context(), messagesAsk("claude-opus-5-5"))(); answer.Model != "claude-sonnet-5-5" || asks.Load() != 1 {
+			t.Fatalf("after %v: %+v, asks %d; want the first decision", step, answer, asks.Load())
+		}
+	}
+	clock.Add(int64(rememberFor))
+	link.Ask(t.Context(), messagesAsk("claude-opus-5-5"))()
+	if asks.Load() != 2 {
+		t.Fatalf("asks %d, want a new one %v after the last use", asks.Load(), rememberFor)
+	}
+}

@@ -40,6 +40,10 @@ func linkTransport() *http.Transport {
 		IdleConnTimeout:       10 * time.Minute,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
+		// An HTTP/2 connection silent for 15 s is pinged and dropped without
+		// an answer in 5 s, so one that died in a sleep or a network change is
+		// found before an ask rides it.
+		HTTP2: &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 5 * time.Second},
 	}
 }
 

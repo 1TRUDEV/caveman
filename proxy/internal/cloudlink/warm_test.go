@@ -278,7 +278,8 @@ func TestNon204WarmIsHarmlessAndBacksOff(t *testing.T) {
 // idle connections held at least 10 min, proxies from the environment.
 func TestLinkTransportKeepsConnections(t *testing.T) {
 	transport, ok := New(t.TempDir(), nil).client.Transport.(*http.Transport)
-	if !ok || !transport.ForceAttemptHTTP2 || transport.IdleConnTimeout < 10*time.Minute || transport.MaxIdleConnsPerHost < 2 || transport.Proxy == nil {
+	if !ok || !transport.ForceAttemptHTTP2 || transport.IdleConnTimeout < 10*time.Minute || transport.MaxIdleConnsPerHost < 2 || transport.Proxy == nil ||
+		transport.HTTP2 == nil || transport.HTTP2.SendPingTimeout <= 0 || transport.HTTP2.PingTimeout <= 0 {
 		t.Fatalf("transport = %+v", transport)
 	}
 }

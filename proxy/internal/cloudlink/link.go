@@ -58,7 +58,7 @@ const (
 	refusedPause = 10 * time.Minute // after a 401/403: a stale or revoked login
 	// askFloor is the least of routeBudget an ask keeps after waiting for the
 	// keychain: a read slower than the rest is no reason to time out at Cloud.
-	askFloor     = 200 * time.Millisecond
+	askFloor     = 500 * time.Millisecond
 	decisionsMax = 1024
 	rememberFor  = 30 * time.Minute // how long a decision or a provider's refusal of a routed model holds
 	statesMax    = 1024
@@ -230,7 +230,17 @@ func (l *Link) settings() settings {
 	cfg := l.load(current, legacy, credentials, filesChanged)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.read = max(l.read, seen)
+	return l.adoptLocked(cfg, stamp, seen, filesChanged)
+}
+
+// adoptLocked stores a load that saw seen secrets. A load older than the one
+// already stored (it saw fewer secrets, finishing last) is dropped: it would
+// put the settings from before a keychain read back.
+func (l *Link) adoptLocked(cfg settings, stamp string, seen int, filesChanged bool) settings {
+	if seen < l.read {
+		return l.cfg
+	}
+	l.read = seen
 	if filesChanged || cfg != l.cfg {
 		previous := l.cfg
 		l.cfg, l.stamp, l.loaded = cfg, stamp, true
@@ -550,7 +560,8 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 	// The first request after a start can land before the keychain read: it
 	// waits for it, leaving the ask at least askFloor of its budget.
 	cfg, loading := l.signedInSettings(deadline.Add(-askFloor))
-	if loading {
+	if loading || cfg.signedIn() && time.Until(deadline) < askFloor {
+		// No ask on what is left: a timeout would pause routing for a minute.
 		return gateway.RouteAnswer{Outcome: "degraded", Reason: "credential_loading"}
 	}
 	if !cfg.routing || cfg.offline || !cfg.signedIn() {
@@ -610,6 +621,9 @@ func (l *Link) decide(ask gateway.RouteAsk, deadline time.Time) gateway.RouteAns
 	l.mu.Lock()
 	d, seen := l.decisions[string(key[:])]
 	seen = seen && l.now().Sub(d.at) < rememberFor
+	if seen {
+		d.at = l.now() // sliding: a long tool loop keeps its answer to the end
+	}
 	paused := !seen && l.now().Before(l.pauseUntil)
 	if !seen {
 		if l.decisions == nil || len(l.decisions) >= decisionsMax {
@@ -1131,7 +1145,6 @@ func (l *Link) ask(cfg settings, bearer string, ask gateway.RouteAsk, declared r
 		}
 		request.Header.Set("content-type", "application/json")
 		request.Header.Set("authorization", "Bearer "+bearer)
-		request.Header["X-Idempotency-Key"] = nil // replayable: a dead kept-alive connection is retried on a new one
 		sent := time.Now()
 		response, err := l.client.Do(request)
 		if l.logger != nil {
