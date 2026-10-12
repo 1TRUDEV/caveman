@@ -832,6 +832,9 @@ function invokedCommand(legacyVerb: string, groupedTail = ""): string {
 
 let currentInvocation: ResolvedInvocation;
 currentInvocation = resolveInvocation(process.argv.slice(2));
+// Version 6 = the line also covers caveman-blocks' script counts: Blocks reads
+// this decision from cloud.json and, from version 6, enrolls under the same id
+// without a second notice, so one `caveman telemetry off` turns both off.
 // Version 5 = the receiver stores the client IP address with each event. v4 was
 // default-on (opt-out) plus token volume (command_run carries the local proxy's
 // processed/saved token deltas). A stale-version "yes" was given for a narrower
@@ -839,14 +842,16 @@ currentInvocation = resolveInvocation(process.argv.slice(2));
 // flipped on). A persisted decision from any version — including a "no" to the
 // old v1 [y/N] prompt — is honored forever; the default only fills the undecided
 // gap, and the first default-on run prints the disclosure line.
-const TELEMETRY_PROMPT_VERSION = 5;
+const TELEMETRY_PROMPT_VERSION = 6;
 // Supabase Edge Function; source and schema live in supabase/ at the repo root.
 const TELEMETRY_URL = "https://xvfgtprkhzlvegvmeefq.supabase.co/functions/v1/cli-telemetry";
 const PROD_API_URL = "https://api.caveman.so";
 // Where `telemetry off` points someone who wants already-sent events deleted.
 const TELEMETRY_DELETION_URL = "https://github.com/JuliusBrussee/caveman/blob/main/SECURITY.md#delete-sent-telemetry";
+// caveman-blocks follows this decision (control 6 in its docs/TELEMETRY.md).
+const TELEMETRY_OFF_NOTE = "caveman-blocks telemetry is off too";
 const TELEMETRY_DISCLOSURE_LINE =
-  "usage stats on — commands, agent sessions, token totals, account and install type, timezone and language, and your IP address; never prompts, code, or file paths · caveman telemetry off";
+  "usage stats on — commands, agent sessions, token totals, account and install type, timezone and language, caveman-blocks script counts (runs, hints, byte totals), and your IP address; never prompts, code, file paths, or scripts and block names you wrote · caveman telemetry off (Blocks too)";
 // Reading token totals means spawning caveman-proxy to query the local SQLite
 // store. It runs after the command's own work, so the cost lands on process exit;
 // a slow or wedged binary drops the token fields rather than holding the CLI.
@@ -1119,7 +1124,7 @@ async function telemetryCmd(argv: string[]) {
   if (sub === "session") return telemetrySession(argv.slice(1));
   if (sub === "send") return telemetrySend();
   emitCommandRunOnce("error", "usage");
-  console.error(`usage: ${invokedCommand("telemetry")} [status|on|off]`);
+  console.error(`usage: ${invokedCommand("telemetry")} [status|on|off]  (off also turns off caveman-blocks telemetry)`);
   process.exit(2);
 }
 
@@ -1176,10 +1181,10 @@ async function telemetryOff() {
   // The id leaves the config here, and it is the only key to events already
   // sent, so show it once with where to ask for their deletion.
   if (prior?.anonymousId) {
-    print({ telemetry: "off", anonymous_id: "none", discarded_anonymous_id: prior.anonymousId, delete_sent_data: TELEMETRY_DELETION_URL });
+    print({ telemetry: "off", anonymous_id: "none", discarded_anonymous_id: prior.anonymousId, delete_sent_data: TELEMETRY_DELETION_URL, note: TELEMETRY_OFF_NOTE });
     return;
   }
-  print({ telemetry: "off", anonymous_id: "none" });
+  print({ telemetry: "off", anonymous_id: "none", note: TELEMETRY_OFF_NOTE });
 }
 
 // Native sessions are where installed users show up: after setup most people
