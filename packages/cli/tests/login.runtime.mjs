@@ -54,6 +54,8 @@ function startStub({ gatewayUrl } = {}) {
       } else if (req.url === "/api/v1/auth/me") {
         capturedAuth = req.headers.authorization;
         send(200, { user: { email: "a@b.c" } });
+      } else if (req.url === "/api/v1/auth/logout") {
+        send(200, {});
       } else {
         send(404, {});
       }
@@ -380,4 +382,44 @@ test("status names a pre-v4 login's gateway and how to keep it", async () => {
   assert.match(status.stdout, /^agent traffic: local runtime · to keep using https:\/\/gateway\.example\.test: caveman login --gateway-url https:\/\/gateway\.example\.test$/m);
   const json = JSON.parse((await runCli(["status", "--json"], env)).stdout);
   assert.equal(json.agent_traffic.target, "local");
+});
+
+// A failed background refresh describes the credential it ran under. Native
+// wiring never runs that refresh again, so a new login, or a logout, must drop
+// it or status says "account refresh offline" for good.
+test("login and logout drop the previous credential's refresh outcome", async () => {
+  const { server } = startStub();
+  const port = await listen(server);
+  const home = mkdtempSync(join(tmpdir(), "cave-home-"));
+  const caveDir = mkdtempSync(join(tmpdir(), "cave-dot-"));
+  const env = { ...process.env, HOME: home, CAVEMAN_HOME: caveDir, CAVE_NO_KEYCHAIN: "1", CAVEMAN_OFFLINE: "1" };
+  delete env.CAVE_TOKEN;
+  delete env.CAVE_GATEWAY_URL;
+  const cloud = join(caveDir, "cloud.json");
+  const plantStaleRefresh = () => writeFileSync(cloud, JSON.stringify({
+    ...(existsSync(cloud) ? JSON.parse(readFileSync(cloud, "utf8")) : { baseURL: "http://127.0.0.1:1" }),
+    wrapEntitlementRefresh: { at: "2026-09-01T00:00:00.000Z", ok: false },
+    wrapEntitlementRunRefreshWeek: "2026-09-01",
+  }));
+  const offline = /account refresh offline/;
+  try {
+    plantStaleRefresh();
+    assert.match((await runCli(["status"], env)).stdout, offline);
+
+    const login = await runCli(["login", "--no-browser", "--base-url", `http://127.0.0.1:${port}`], env);
+    assert.equal(login.code, 0, `login failed: ${login.stderr}`);
+    let cfg = JSON.parse(readFileSync(cloud, "utf8"));
+    assert.equal("wrapEntitlementRefresh" in cfg, false);
+    assert.equal("wrapEntitlementRunRefreshWeek" in cfg, false);
+    assert.doesNotMatch((await runCli(["status"], env)).stdout, offline);
+
+    plantStaleRefresh();
+    const logout = await runCli(["logout"], env);
+    assert.equal(logout.code, 0, `logout failed: ${logout.stderr}`);
+    cfg = JSON.parse(readFileSync(cloud, "utf8"));
+    assert.equal("wrapEntitlementRefresh" in cfg, false);
+    assert.equal("wrapEntitlementRunRefreshWeek" in cfg, false);
+  } finally {
+    server.close();
+  }
 });
