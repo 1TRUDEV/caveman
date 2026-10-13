@@ -5467,6 +5467,17 @@ function refreshWrapEntitlementInBackground(options: { wrappedRun?: boolean } = 
   });
 }
 
+// The refresh outcome and the weekly run claim belong to the credential they ran
+// under. Login and logout replace that credential, so they drop both: native
+// wiring never runs the background refresh, and a stale failure would keep
+// status on "account refresh offline" for good.
+function dropWrapRefreshState() {
+  mutateRawConfig((out) => {
+    delete out.wrapEntitlementRefresh;
+    delete out.wrapEntitlementRunRefreshWeek;
+  });
+}
+
 // ── wrap-start + session-end lines (the §8 golden transcripts) ───────────────────
 
 // SUBSCRIPTION_TOKENS_ONLY_NOTE is the single honesty line for locally compressed
@@ -12493,6 +12504,7 @@ async function login(argv: string[] = [], ui?: SignInUi): Promise<{ email?: stri
   // credential. Do not print authenticated success or continue the post-login
   // bridge until the control plane has recorded that this CLI stored the bundle.
   await saveConfig(saved);
+  dropWrapRefreshState();
   await grant.acknowledge();
   syncAutoEntries();
   // The first-run screen says these its own way.
@@ -12575,6 +12587,7 @@ async function logout() {
 	await saveConfig({ ...cfg, logoutPendingLocalCleanup: true });
   clearToken(cfg.tokenStore);
   await saveConfig({ baseURL: "", token: "" });
+  dropWrapRefreshState();
   syncAutoEntries();
   print({ logged_out: true });
 }
