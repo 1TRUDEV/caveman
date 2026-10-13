@@ -28,7 +28,9 @@ function freshTmpDir() {
 }
 
 // Make a throwaway `opencode` binary on PATH so detectMatch('command:opencode')
-// returns true. The shim never executes — installer only checks PATH presence.
+// returns true. The shim also runs for the `opencode --version` probe, but
+// prints nothing, so opencodeMajorVersion() returns null and the install uses
+// the V1 config path.
 function shimOpencode() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-shim-'));
   if (IS_WIN) {
@@ -36,6 +38,19 @@ function shimOpencode() {
   } else {
     const f = path.join(dir, 'opencode');
     fs.writeFileSync(f, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(f, 0o755);
+  }
+  return dir;
+}
+
+function shimOpencodeV2(versionLine) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-shim-v2-'));
+  const body = '@echo off\r\necho ' + versionLine + '\r\n';
+  if (IS_WIN) {
+    fs.writeFileSync(path.join(dir, 'opencode.cmd'), body);
+  } else {
+    const f = path.join(dir, 'opencode');
+    fs.writeFileSync(f, '#!/bin/sh\necho "' + versionLine + '"\n');
     fs.chmodSync(f, 0o755);
   }
   return dir;
@@ -72,6 +87,12 @@ test('opencode fresh install drops plugin, commands, agents, skills, AGENTS.md, 
     assert.ok(fs.existsSync(path.join(ocDir, 'plugins', 'caveman', 'caveman-config.cjs')), 'caveman-config.cjs sibling missing');
     assert.ok(fs.existsSync(path.join(ocDir, 'plugins', 'caveman', 'caveman-parse.cjs')), 'caveman-parse.cjs sibling missing');
 
+    // Flat shim so opencode V2 auto-discovers the plugin (V2 scans
+    // plugins/*.{js,ts}; a subdirectory is not discovered).
+    const shimPath = path.join(ocDir, 'plugins', 'caveman.js');
+    assert.ok(fs.existsSync(shimPath), 'V2 flat discovery shim plugins/caveman.js missing');
+    assert.match(fs.readFileSync(shimPath, 'utf8'), /caveman\/plugin\.js/);
+
     for (const f of ['caveman.md', 'ultracave.md', 'megacave.md', 'caveman-commit.md', 'caveman-review.md', 'caveman-compress.md', 'caveman-stats.md', 'caveman-help.md']) {
       assert.ok(fs.existsSync(path.join(ocDir, 'commands', f)), `command ${f} missing`);
     }
@@ -97,7 +118,7 @@ test('opencode fresh install drops plugin, commands, agents, skills, AGENTS.md, 
     assert.ok(fs.existsSync(cfgPath), 'opencode.jsonc missing');
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
     assert.ok(Array.isArray(cfg.plugin), 'opencode.jsonc missing plugin array');
-    assert.ok(cfg.plugin.includes('./plugins/caveman/plugin.js'), 'plugin entry missing');
+    assert.ok(cfg.plugin.includes('./plugins/caveman.js'), 'V1 plugin entry missing');
   } finally {
     fs.rmSync(xdg, { recursive: true, force: true });
     fs.rmSync(shimDir, { recursive: true, force: true });
@@ -116,7 +137,7 @@ test('opencode idempotent install does not duplicate plugin entries', () => {
     assert.notEqual(r2.status, 2);
 
     const cfg = JSON.parse(fs.readFileSync(path.join(xdg, 'opencode', 'opencode.jsonc'), 'utf8'));
-    const matches = cfg.plugin.filter(p => p === './plugins/caveman/plugin.js');
+    const matches = cfg.plugin.filter(p => p === './plugins/caveman.js');
     assert.equal(matches.length, 1, `expected 1 plugin entry, got ${matches.length}`);
 
     // AGENTS.md should not have the ruleset duplicated either.
@@ -304,7 +325,7 @@ test('opencode install tolerates JSONC opencode.json (comments + trailing commas
     const cfg = JSON.parse(fs.readFileSync(path.join(ocDir, 'opencode.json'), 'utf8'));
     assert.equal(cfg.model, 'anthropic/claude-sonnet-4-5', 'user model setting wiped');
     assert.equal(cfg.theme, 'dark', 'user theme setting wiped');
-    assert.ok(cfg.plugin.includes('./plugins/caveman/plugin.js'), 'plugin entry missing');
+    assert.ok(cfg.plugin.includes('./plugins/caveman.js'), 'V1 plugin entry missing');
   } finally {
     fs.rmSync(xdg, { recursive: true, force: true });
     fs.rmSync(shimDir, { recursive: true, force: true });
@@ -325,6 +346,7 @@ test('opencode uninstall removes plugin dir, command/agent/skill files, prunes o
 
     const ocDir = path.join(xdg, 'opencode');
     assert.equal(fs.existsSync(path.join(ocDir, 'plugins', 'caveman')), false, 'plugin dir survived');
+    assert.equal(fs.existsSync(path.join(ocDir, 'plugins', 'caveman.js')), false, 'V2 discovery shim survived');
     assert.equal(fs.existsSync(path.join(ocDir, 'commands', 'caveman.md')), false, 'caveman.md command survived');
     assert.equal(fs.existsSync(path.join(ocDir, 'agents', 'cavecrew-builder.md')), false, 'cavecrew agent survived');
     assert.equal(fs.existsSync(path.join(ocDir, 'skills', 'caveman')), false, 'caveman skill dir survived');
@@ -334,8 +356,11 @@ test('opencode uninstall removes plugin dir, command/agent/skill files, prunes o
       const cfgPath = path.join(ocDir, name);
       if (!fs.existsSync(cfgPath)) continue;
       const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-      const stillHasPlugin = Array.isArray(cfg.plugin) && cfg.plugin.includes('./plugins/caveman/plugin.js');
-      assert.equal(stillHasPlugin, false, `plugin entry survived in ${name}`);
+      const leftover = [
+        ...(Array.isArray(cfg.plugin) ? cfg.plugin : []),
+        ...(Array.isArray(cfg.plugins) ? cfg.plugins : []),
+      ].filter(p => p === './plugins/caveman/plugin.js' || p === './plugins/caveman.js');
+      assert.equal(leftover.length, 0, `plugin entry survived in ${name}`);
     }
   } finally {
     fs.rmSync(xdg, { recursive: true, force: true });
@@ -369,8 +394,11 @@ test('opencode plugin handles /caveman ultra, /megacave, stop caveman, and sessi
     process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
 
     const mod = await import(pathToFileURL(pluginPath).href);
-    const factory = mod.default || mod.CavemanPlugin;
-    const handlers = await factory({});
+    // Dual export: default is { id, setup, server }; these tests drive V1.
+    assert.equal(mod.default.id, 'caveman', 'plugin id missing');
+    assert.equal(typeof mod.default.setup, 'function', 'V2 setup entrypoint missing');
+    assert.equal(typeof mod.default.server, 'function', 'V1 server entrypoint missing');
+    const handlers = await mod.default.server({});
 
     // The dead direct-key hooks must NOT be registered.
     assert.equal(handlers['tui.prompt.append'], undefined, 'tui.prompt.append should not exist');
@@ -525,8 +553,11 @@ test('opencode system.transform injects the active mode\'s SKILL.md body or thes
     process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
 
     const mod = await import(pathToFileURL(pluginPath).href);
-    const factory = mod.default || mod.CavemanPlugin;
-    const handlers = await factory({});
+    // Dual export: default is { id, setup, server }; these tests drive V1.
+    assert.equal(mod.default.id, 'caveman', 'plugin id missing');
+    assert.equal(typeof mod.default.setup, 'function', 'V2 setup entrypoint missing');
+    assert.equal(typeof mod.default.server, 'function', 'V1 server entrypoint missing');
+    const handlers = await mod.default.server({});
 
     // The caveman skill is installed beside the plugin, so its whole body
     // travels.
@@ -594,7 +625,7 @@ test('opencode system.transform degrades to the banner when caveman-config.cjs p
     process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
     const pluginPath = path.join(xdg, 'opencode', 'plugins', 'caveman', 'plugin.js');
     const mod = await import(pathToFileURL(pluginPath).href + '?stale');
-    const handlers = await (mod.default || mod.CavemanPlugin)({});
+    const handlers = await mod.default.server({});
 
     await handlers['chat.message']({}, { parts: [{ type: 'text', text: '/caveman' }] });
     const sys = { system: [] };
@@ -641,7 +672,7 @@ test('opencode session init still activates when caveman-config.cjs predates rec
     const pluginPath = path.join(pluginDir, 'plugin.js');
     // Factory construction is where the unguarded call would throw.
     const mod = await import(pathToFileURL(pluginPath).href + '?norecord');
-    const handlers = await (mod.default || mod.CavemanPlugin)({});
+    const handlers = await mod.default.server({});
 
     assert.equal(fs.readFileSync(path.join(xdg, 'opencode', '.caveman-active'), 'utf8').trim(), 'caveman',
       'session init must still write the mode flag with no recordModeChange export');
@@ -696,6 +727,212 @@ test('opencode leaves an AGENTS.md with unmatched caveman markers untouched', ()
   }
 });
 
+// ── V2: setup(ctx) drives the same behavior through the V2 API ──────────────
+// Mirrors the V1 smoke test against the object's `setup` entrypoint, with a
+// mock V2 context: `session.hook(name, cb)` captures callbacks and
+// `event.subscribe()` is an async iterable.
+test('opencode V2 setup() parses raw prompts, injects SystemPart reinforcement, and bails on a V1 context', async () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencode();
+  const origDefault = process.env.CAVEMAN_DEFAULT_MODE;
+  const origXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    assert.notEqual(runInstaller(['--only', 'opencode'], env).status, 2);
+
+    const pluginPath = path.join(xdg, 'opencode', 'plugins', 'caveman', 'plugin.js');
+    const flagPath = path.join(xdg, 'opencode', '.caveman-active');
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
+
+    const mod = await import(pathToFileURL(pluginPath).href + '?v2');
+    assert.equal(mod.default.id, 'caveman');
+    assert.equal(typeof mod.default.setup, 'function');
+
+    const hooks = {};
+    let subscribeCalls = 0;
+    const ctx = {
+      session: { hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; } },
+      event: {
+        subscribe: async function* (opts) {
+          subscribeCalls++;
+          try {
+            await new Promise((r) => setTimeout(r, 30));
+            if (!opts.signal.aborted) yield { type: 'session.created' };
+          } catch (_) {}
+        },
+      },
+    };
+    const cleanup = await mod.default.setup(ctx);
+    assert.deepEqual(
+      Object.keys(hooks).sort(),
+      ['compaction', 'context', 'generate', 'prompt', 'title'],
+      'V2 hooks registered',
+    );
+    assert.equal(subscribeCalls, 1, 'event subscription started');
+    // Eager write covers the one-shot run race (session.created fires before an
+    // async subscription can observe it).
+    assert.equal(fs.readFileSync(flagPath, 'utf8'), 'caveman');
+
+    // V2 prompt hook sees raw quote-wrapped command text, not an expanded
+    // template; the shared parser must handle it directly.
+    hooks.prompt({ prompt: { text: '"/caveman ultra"' } });
+    assert.equal(fs.readFileSync(flagPath, 'utf8'), 'ultracave');
+
+    // context injects into an existing SystemPart rather than adding a second
+    // system message.
+    const sys = { system: [{ type: 'text', text: 'base' }] };
+    hooks.context(sys);
+    assert.equal(sys.system.length, 1, 'must not add a second system message');
+    assert.match(sys.system[0].text, /^base\n\nCAVEMAN MODE ACTIVE \(ultracave\)/);
+    assert.match(sys.system[0].text, /Only fluff die/, 'ultracave thesis expected');
+
+    // Idempotent across repeated transforms on the SAME array.
+    hooks.context(sys);
+    hooks.context(sys);
+    assert.equal((sys.system[0].text.match(/CAVEMAN MODE ACTIVE/g) || []).length, 1);
+
+    // Mid-session switch rewrites in place; the old mode's rules are dropped.
+    hooks.prompt({ prompt: { text: '/caveman' } });
+    hooks.context(sys);
+    assert.match(sys.system[0].text, /CAVEMAN MODE ACTIVE \(caveman\)/);
+    assert.doesNotMatch(sys.system[0].text, /Only fluff die\. Then cut again\./, 'switch must drop ultracave thesis');
+
+    // Empty system array -> push a SystemPart.
+    const empty = { system: [] };
+    hooks.context(empty);
+    assert.equal(empty.system.length, 1);
+    assert.equal(empty.system[0].type, 'text');
+
+    // Status rewrite without changing mode.
+    const status = { prompt: { text: '/caveman status' } };
+    hooks.prompt(status);
+    assert.equal(status.prompt.text,
+      'Report this status verbatim without changing mode: Caveman mode: caveman');
+
+    // Deactivation removes the flag and stops injection.
+    hooks.prompt({ prompt: { text: 'stop caveman' } });
+    assert.equal(fs.existsSync(flagPath), false);
+    const off = { system: [{ type: 'text', text: 'x' }] };
+    hooks.context(off);
+    assert.equal(off.system[0].text, 'x', 'no reinforcement when inactive');
+
+    // A host exposing both entrypoints calls setup() with the V1 input
+    // (no ctx.session): must bail without throwing so server() can run.
+    assert.equal(await mod.default.setup({ client: {}, directory: '/x' }), undefined);
+
+    cleanup && cleanup();
+  } finally {
+    if (origDefault === undefined) delete process.env.CAVEMAN_DEFAULT_MODE;
+    else process.env.CAVEMAN_DEFAULT_MODE = origDefault;
+    if (origXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = origXdg;
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
+// ── V2 one-shot restore parity with the V1 chat.message path (#599) ─────────
+// The V2 prompt hook must mirror the V1 one-shot bookkeeping: a chained
+// /caveman-commit then /caveman-review restores the ORIGINAL prose mode, a
+// one-shot from off returns to off, and a status probe consumes no restore.
+test('opencode V2 setup() restores the displaced prose mode after a one-shot, matching V1', async () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencode();
+  const origDefault = process.env.CAVEMAN_DEFAULT_MODE;
+  const origXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    assert.notEqual(runInstaller(['--only', 'opencode'], env).status, 2);
+
+    const pluginPath = path.join(xdg, 'opencode', 'plugins', 'caveman', 'plugin.js');
+    const flagPath = path.join(xdg, 'opencode', '.caveman-active');
+    const prevPath = path.join(xdg, 'opencode', '.caveman-active.prev');
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
+
+    const mod = await import(pathToFileURL(pluginPath).href + '?v2-oneshot');
+    const hooks = {};
+    const ctx = { session: { hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; } } };
+    await mod.default.setup(ctx);
+
+    const send = (text) => hooks.prompt({ prompt: { text } });
+    const flag = () => (fs.existsSync(flagPath) ? fs.readFileSync(flagPath, 'utf8') : null);
+
+    // A one-shot displaces ultracave and remembers it.
+    send('/ultracave');
+    assert.equal(flag(), 'ultracave');
+    send('/caveman-commit');
+    assert.equal(flag(), 'commit', 'one-shot must take effect for its own turn');
+    assert.equal(fs.readFileSync(prevPath, 'utf8'), 'ultracave', 'displaced prose mode remembered');
+
+    // The next ordinary prompt restores it.
+    send('now fix the parser bug');
+    assert.equal(flag(), 'ultracave', 'next ordinary prompt must restore the displaced prose mode');
+    assert.equal(fs.existsSync(prevPath), false, 'prev cleared once consumed');
+
+    // Chained one-shots keep the first return target.
+    send('/caveman-commit');
+    send('/caveman-review');
+    assert.equal(flag(), 'review');
+    assert.equal(fs.readFileSync(prevPath, 'utf8'), 'ultracave', 'chained one-shots keep the original target');
+    send('ship it');
+    assert.equal(flag(), 'ultracave', 'chained one-shots restore the original prose mode');
+
+    // A one-shot entered from off must return to off, never a stale target.
+    send('stop caveman');
+    assert.equal(flag(), null);
+    send('/caveman-compress');
+    assert.equal(flag(), 'compress');
+    send('summarize that');
+    assert.equal(flag(), null, 'a one-shot entered from off must return to off');
+
+    // A status probe is observational: it must not consume a pending restore.
+    send('/ultracave');
+    send('/caveman-commit');
+    send('/caveman status');
+    assert.equal(flag(), 'commit', 'status must not consume the pending one-shot');
+    send('fix it');
+    assert.equal(flag(), 'ultracave', 'restore still fires on the next real turn');
+  } finally {
+    if (origDefault === undefined) delete process.env.CAVEMAN_DEFAULT_MODE;
+    else process.env.CAVEMAN_DEFAULT_MODE = origDefault;
+    if (origXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = origXdg;
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
+// ── V2 install: no `plugin` config entry (flat shim is auto-discovered) ─────
+test('opencode V2 install omits the V1 plugin entry and prunes only its own legacy entries', () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencodeV2('opencode v2.0.22');
+  try {
+    const ocDir = path.join(xdg, 'opencode');
+    fs.mkdirSync(ocDir, { recursive: true });
+    // Seed a legacy caveman entry plus an unrelated user plugin, and a V2 key
+    // with a stale caveman path, to prove only caveman entries are pruned.
+    fs.writeFileSync(path.join(ocDir, 'opencode.jsonc'), JSON.stringify({
+      plugin: ['./plugins/caveman/plugin.js', 'opencode-other'],
+      plugins: ['./plugins/caveman.js'],
+    }, null, 2));
+
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    const r = runInstaller(['--only', 'opencode'], env);
+    assert.notEqual(r.status, 2, `argv error: ${r.stderr}`);
+
+    const cfg = JSON.parse(fs.readFileSync(path.join(ocDir, 'opencode.jsonc'), 'utf8'));
+    assert.deepEqual(cfg.plugin, ['opencode-other'], 'only caveman entries pruned from V1 key');
+    assert.equal(cfg.plugins, undefined, 'V2 gets no config entry — the flat shim is auto-discovered');
+    assert.ok(fs.existsSync(path.join(ocDir, 'plugins', 'caveman.js')), 'flat shim not installed');
+    assert.ok(fs.existsSync(path.join(ocDir, 'plugins', 'caveman', 'plugin.js')), 'payload not installed');
+  } finally {
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
 // ── 9. One-shot independent modes restore the displaced prose mode ──────────
 // #599 parity. On Claude Code, caveman-mode-tracker.js remembers the prose mode
 // a one-shot (/caveman-commit, /caveman-review, /caveman-compress) displaces and
@@ -723,7 +960,7 @@ test('opencode plugin restores the displaced prose mode after a one-shot mode', 
     process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
 
     const mod = await import(pathToFileURL(pluginPath).href);
-    const handlers = await (mod.default || mod.CavemanPlugin)({});
+    const handlers = await mod.default.server({});
 
     const send = (text) => handlers['chat.message']({}, { parts: [{ type: 'text', text }] });
     const reinforced = async () => {
@@ -838,7 +1075,7 @@ test('opencode plugin does not deactivate caveman when the config copy predates 
 
     // Cache-bust: earlier tests in this file already imported plugin.js.
     const mod = await import(`${pathToFileURL(path.join(pluginDir, 'plugin.js')).href}?legacy-config`);
-    const handlers = await (mod.default || mod.CavemanPlugin)({});
+    const handlers = await mod.default.server({});
     const send = (text) => handlers['chat.message']({}, { parts: [{ type: 'text', text }] });
     const flag = () => (fs.existsSync(flagPath) ? fs.readFileSync(flagPath, 'utf8') : null);
 
