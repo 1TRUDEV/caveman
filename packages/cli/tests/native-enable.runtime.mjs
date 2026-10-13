@@ -9,6 +9,7 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isolatedCliEnv } from "./_cli.mjs";
+import { assertHidesChildWindows, assertHidesChildWindowsPython } from "./harness/hidden-window.mjs";
 
 const cli = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
 
@@ -1579,6 +1580,7 @@ test("enable/disable hermes installs native lifecycle pack and preserves unrelat
   assert.match(plugin, /native-hook/);
   assert.match(plugin, /"task_continuation": _task_continuation\(user_message\)/);
   assert.match(plugin, /ctx\.register_hook\("pre_tool_call"/);
+  assertHidesChildWindowsPython(plugin, "hermes native plugin");
   const compiled = spawnSync("python3", ["-m", "py_compile", join(pluginDir, "__init__.py")], {
     env: { ...env, PYTHONPYCACHEPREFIX: join(fx.home, "pycache") },
     encoding: "utf8",
@@ -1702,6 +1704,7 @@ test("enable/disable opencode installs one native plugin, routed providers and r
     assert.match(plugin, new RegExp(surface.replaceAll(".", "\\.")));
   }
   assert.match(plugin, /native-hook", "opencode/);
+  assertHidesChildWindows(plugin, "opencode native plugin");
   assert.match(plugin, /export const CavemanNative/, "an OpenCode 1.x host keeps the V1 hook map (#1083)");
   const syntax = spawnSync(process.execPath, ["--check", pluginPath], { encoding: "utf8" });
   assert.equal(syntax.status, 0, syntax.stderr);
@@ -1836,6 +1839,87 @@ test("doctor and status warn when OpenCode's active provider is not routed (#119
   config.model = "opencode-go/glm-5.2";
   writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
   assert.deepEqual(JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings, []);
+});
+
+// #1254: the routed set is read from the install journal, which holds only the
+// three routes `enable` writes. A provider the user routed by hand — baseURL
+// pointed at the gateway's own /w/opencode compat mount, with the matching
+// mount in caveman.yaml — was therefore reported as going direct and
+// "not compressed or counted", while the proxy's own request table showed
+// every one of its calls. Same shape as #1212 on the pi extension: the check
+// looked at the provider NAME and never at where it actually sends requests.
+test("an OpenCode provider routed by hand through a compat mount is not called unrouted (#1254)", async () => {
+  const fx = fixture();
+  const env = { ...fx.env, XDG_DATA_HOME: join(fx.home, ".local", "share") };
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  const configPath = join(configDir, "opencode.json");
+  writeFileSync(configPath, JSON.stringify({}) + "\n");
+  assert.equal((await run(["enable", "opencode"], env)).code, 0);
+
+  // The reporter's setup: one signed-in provider, no model pinned, baseURL on
+  // the gateway's compat mount, and that mount declared in caveman.yaml.
+  mkdirSync(join(fx.home, ".local", "share", "opencode"), { recursive: true });
+  writeFileSync(join(fx.home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ "ollama-cloud": { type: "api" } }));
+  writeFileSync(join(fx.home, ".caveman", "caveman.yaml"), "compat:\n  ollama-cloud:\n    base_url: https://ollama.com/v1\n");
+
+  const routedThroughMount = (baseURL) => {
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.provider["ollama-cloud"] = { options: { baseURL } };
+    delete config.model;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  };
+
+  routedThroughMount("http://127.0.0.1:8787/w/opencode/compat/ollama-cloud/v1");
+  const doctor = JSON.parse((await run(["doctor", "opencode"], env)).stdout);
+  assert.equal(doctor.state, "installed");
+  assert.deepEqual(doctor.warnings, [], "a provider pointed at its own compat mount IS routed");
+
+  // A pinned model reaches the other branch of the same check.
+  const pinned = JSON.parse(readFileSync(configPath, "utf8"));
+  pinned.model = "ollama-cloud/qwen3-coder:480b";
+  writeFileSync(configPath, JSON.stringify(pinned, null, 2) + "\n");
+  assert.deepEqual(JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings, []);
+
+  // The built-in wedge paths enable itself writes are routed for the same
+  // reason, whatever name the user filed them under.
+  routedThroughMount("http://127.0.0.1:8787/w/opencode/openai/v1");
+  assert.deepEqual(JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings, []);
+});
+
+test("OpenCode providers that really do go direct still warn (#1254 keeps #1190)", async () => {
+  const fx = fixture();
+  const env = { ...fx.env, XDG_DATA_HOME: join(fx.home, ".local", "share") };
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  const configPath = join(configDir, "opencode.json");
+  writeFileSync(configPath, JSON.stringify({}) + "\n");
+  assert.equal((await run(["enable", "opencode"], env)).code, 0);
+  mkdirSync(join(fx.home, ".local", "share", "opencode"), { recursive: true });
+  writeFileSync(join(fx.home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ "ollama-cloud": { type: "api" } }));
+  writeFileSync(join(fx.home, ".caveman", "caveman.yaml"), "compat:\n  ollama-cloud:\n    base_url: https://ollama.com/v1\n");
+
+  const warnings = async (baseURL) => {
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    delete config.model;
+    if (baseURL === undefined) delete config.provider["ollama-cloud"];
+    else config.provider["ollama-cloud"] = { options: { baseURL } };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    return JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings.join("\n");
+  };
+
+  // No baseURL at all, and a baseURL aimed at the upstream: both go direct.
+  assert.match(await warnings(undefined), /"ollama-cloud" is not routed through Caveman/);
+  assert.match(await warnings("https://ollama.com/v1"), /"ollama-cloud" is not routed through Caveman/);
+  // Another process on the gateway's port is not the gateway's wedge.
+  assert.match(await warnings("http://127.0.0.1:8787/v1"), /"ollama-cloud" is not routed through Caveman/);
+
+  // Pointed at a compat mount that does not exist, the request reaches the
+  // proxy and 404s. Saying it "goes direct" names the wrong cause, so this
+  // case gets the mount it is missing instead.
+  const missingMount = await warnings("http://127.0.0.1:8787/w/opencode/compat/typo-cloud/v1");
+  assert.match(missingMount, /compat\.typo-cloud\.base_url/);
+  assert.doesNotMatch(missingMount, /goes? direct/);
 });
 
 test("status recognizes native OpenCode MCP recovery when the config rewrites key order", async () => {
@@ -2901,4 +2985,73 @@ test("enable names a linked config whose target is read-only", { skip: process.p
   } finally {
     chmodSync(store, 0o755);
   }
+});
+
+// #1247: a user whose Claude settings already route to a third-party
+// Anthropic-protocol gateway (DeepSeek, Z.ai, a corporate relay) carries that
+// gateway's credentials in the same file. enable used to overwrite the route
+// unconditionally, so every later turn went to caveman's own anthropic upstream
+// — api.anthropic.com — and answered "Invalid API key" with nothing naming the
+// cause. The proxy already supports the configuration that keeps both
+// (`providers.anthropic.base_url`), so refuse and name it rather than break a
+// working install.
+test("enable claude refuses to overwrite a third-party ANTHROPIC_BASE_URL", async () => {
+  const fx = fixture();
+  mkdirSync(join(fx.home, ".claude"), { recursive: true });
+  const settingsPath = join(fx.home, ".claude", "settings.json");
+  const original = JSON.stringify({
+    env: {
+      ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic",
+      ANTHROPIC_API_KEY: "sk-user-deepseek",
+    },
+  }, null, 2) + "\n";
+  writeFileSync(settingsPath, original);
+
+  const out = await run(["enable", "claude"], fx.env);
+  assert.notEqual(out.code, 0, "enable must not silently take over a foreign route");
+  assert.match(out.stderr, /ANTHROPIC_BASE_URL/);
+  // v4 names the endpoint and the opt-in instead of providers.anthropic.base_url.
+  assert.match(out.stderr, /its own endpoint https:\/\/api\.deepseek\.com\/anthropic .* was left as is\. To route it through Caveman anyway, remove ANTHROPIC_BASE_URL there/, "refusal must name the endpoint and the way out");
+  assert.equal(readFileSync(settingsPath, "utf8"), original, "refusal must leave settings byte-identical");
+  assert.equal(existsSync(join(fx.home, ".caveman", "integrations", "claude.json")), false, "refused enable must write no journal");
+});
+
+// The refusal must not catch caveman's own route: re-running enable, or an
+// install whose settings already carry a caveman gateway route, is the ordinary
+// idempotent path. An explicitly written-out api.anthropic.com belongs in the
+// same list: the proxy's default anthropic upstream IS that host, so taking the
+// route over does not change where the request lands, and refusing would block
+// enable for everyone who spells the default out longhand.
+test("enable claude still takes over its own route and a managed caveman gateway route", async () => {
+  for (const owned of ["http://127.0.0.1:8787/w/claude", "https://gateway.caveman.so/w/claude", "https://api.anthropic.com"]) {
+    const fx = fixture();
+    mkdirSync(join(fx.home, ".claude"), { recursive: true });
+    const settingsPath = join(fx.home, ".claude", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ env: { ANTHROPIC_BASE_URL: owned } }, null, 2) + "\n");
+    const out = await run(["enable", "claude"], fx.env);
+    assert.equal(out.code, 0, `${owned}: ${out.stderr}`);
+    assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/w/claude");
+  }
+});
+
+// The `caveman <agent>` shortcut answers an enable failure with a session-only
+// wrap. For this conflict that fallback is not a lesser door but the same
+// failure again — wrap redirects ANTHROPIC_BASE_URL too — so the shortcut must
+// surface the refusal instead of burying it in a warning (#1247).
+test("the claude shortcut does not fall back to wrap on a foreign-route conflict", async () => {
+  const fx = fixture();
+  mkdirSync(join(fx.home, ".claude"), { recursive: true });
+  const settingsPath = join(fx.home, ".claude", "settings.json");
+  const original = JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic" } }, null, 2) + "\n";
+  writeFileSync(settingsPath, original);
+
+  const out = await run(["claude"], fx.env);
+  // v4 answers this conflict by launching the agent directly on the user's
+  // endpoint (agent-shortcut.runtime.mjs pins the launch itself), so the
+  // shortcut succeeds; what must still hold is that the reason is on screen,
+  // nothing is rerouted and the settings are untouched.
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /points at your own endpoint https:\/\/api\.deepseek\.com\/anthropic, which the proxy cannot forward to; launching directly/);
+  assert.doesNotMatch(out.stderr, /using session-only wrap for this run/);
+  assert.equal(readFileSync(settingsPath, "utf8"), original);
 });
