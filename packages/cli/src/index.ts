@@ -13832,7 +13832,11 @@ function buildPiWrapArgs(cmdArgs: string[], env: NodeJS.ProcessEnv, gw: string):
   // After `caveman enable pi`, Pi already auto-loads the owned copy. A second
   // copy registers caveman_retrieve twice, which Pi treats as a fatal startup
   // error, so the session-only copy stays out.
-  if (existsSync(piNativeExtensionPath())) return cmdArgs;
+  // Only when Pi will really load it: a Caveman-owned file, in the directory Pi
+  // reads, with discovery left on. Otherwise the session copy is the only one.
+  const owned = fileBytes(piNativeExtensionPath())?.toString("utf8").includes("caveman:native-pi");
+  const discovery = !env.PI_CODING_AGENT_DIR && !cmdArgs.some((arg) => arg === "--no-extensions" || arg === "-ne");
+  if (owned && discovery) return cmdArgs;
   // The profile's injection block declares the loader flag; using it here keeps the
   // compiled registry the single source of truth for how the asset is loaded.
   const profile = AGENTS.find((a) => a.id === "pi");

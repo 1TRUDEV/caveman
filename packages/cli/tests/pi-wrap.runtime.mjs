@@ -58,9 +58,9 @@ function fixture(cliPath = cli) {
   };
 }
 
-function run(fx, command = "wrap") {
+function run(fx, command = "wrap", extra = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [fx.cliPath, command, "pi", "--", "--print", "hi"], { env: fx.env });
+    const child = spawn(process.execPath, [fx.cliPath, command, "pi", "--", "--print", "hi", ...extra], { env: fx.env });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => (stdout += chunk));
@@ -109,6 +109,14 @@ test("wrap pi does not load a second extension when the enabled one is installed
     const seen = JSON.parse(readFileSync(fx.capture, "utf8"));
     assert.deepEqual(seen.argv, ["--", "--print", "hi"]);
     assert.ok(JSON.parse(seen.hook).length >= 1, "the hook environment is still stamped");
+
+    // Pi will not load the owned copy with discovery off or its agent dir moved.
+    for (const [args, extra] of [[["--no-extensions"], {}], [[], { PI_CODING_AGENT_DIR: join(fx.root, "elsewhere") }]]) {
+      Object.assign(fx.env, extra);
+      const again = await run(fx, "wrap", args);
+      assert.equal(again.code, 0, again.stderr);
+      assert.deepEqual(JSON.parse(readFileSync(fx.capture, "utf8")).argv.slice(0, 2), ["--extension", extension]);
+    }
   } finally {
     fx.cleanup();
   }
