@@ -9562,11 +9562,15 @@ function opencodeNativeMutations(gw: string, mcpBinary: string, plan = false): N
   ];
 }
 
+// Pi's extension auto-discovery accepts only .ts/.js (isExtensionFile in
+// pi-coding-agent 0.84.2); a .mjs here would journal fine and never load.
+function piNativeExtensionPath(): string {
+  return join(homedir(), ".pi", "agent", "extensions", "caveman-native.js");
+}
+
 function piNativeMutations(): NativeMutation[] {
-  const extensionDir = join(homedir(), ".pi", "agent", "extensions");
-  // Pi's extension auto-discovery accepts only .ts/.js (isExtensionFile in
-  // pi-coding-agent 0.84.2); a .mjs here would journal fine and never load.
-  const extensionPath = join(extensionDir, "caveman-native.js");
+  const extensionPath = piNativeExtensionPath();
+  const extensionDir = dirname(extensionPath);
   const before = fileBytes(extensionPath);
   if (before && !before.toString("utf8").includes("caveman:native-pi")) {
     throw new Error(`${extensionPath} already exists and is not Caveman-owned; refusing to overwrite it`);
@@ -13825,6 +13829,10 @@ function buildPiWrapArgs(cmdArgs: string[], env: NodeJS.ProcessEnv, gw: string):
   const { cmd, pre } = cavemanInvocation();
   env.CAVEMAN_PI_HOOK_CMD = JSON.stringify([cmd, ...pre]);
   env.CAVE_GATEWAY_URL = gw;
+  // After `caveman enable pi`, Pi already auto-loads the owned copy. A second
+  // copy registers caveman_retrieve twice, which Pi treats as a fatal startup
+  // error, so the session-only copy stays out.
+  if (existsSync(piNativeExtensionPath())) return cmdArgs;
   // The profile's injection block declares the loader flag; using it here keeps the
   // compiled registry the single source of truth for how the asset is loaded.
   const profile = AGENTS.find((a) => a.id === "pi");

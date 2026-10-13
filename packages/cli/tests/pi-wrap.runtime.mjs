@@ -93,6 +93,27 @@ test("wrap and run pi put extension first and stamp native hook environment", as
   }
 });
 
+// Pi auto-loads the copy `caveman enable pi` owns. Loading the session copy on
+// top registers caveman_retrieve twice, and Pi exits 1 on that conflict.
+test("wrap pi does not load a second extension when the enabled one is installed", async () => {
+  const fx = fixture();
+  try {
+    const extension = join(fx.root, "extension.mjs");
+    writeFileSync(extension, "export default function fixture() {}\n");
+    fx.env.CAVEMAN_PI_EXTENSION = extension;
+    const owned = join(fx.env.HOME, ".pi", "agent", "extensions");
+    mkdirSync(owned, { recursive: true });
+    writeFileSync(join(owned, "caveman-native.js"), "// caveman:native-pi\n");
+    const out = await run(fx, "wrap");
+    assert.equal(out.code, 0, out.stderr);
+    const seen = JSON.parse(readFileSync(fx.capture, "utf8"));
+    assert.deepEqual(seen.argv, ["--", "--print", "hi"]);
+    assert.ok(JSON.parse(seen.hook).length >= 1, "the hook environment is still stamped");
+  } finally {
+    fx.cleanup();
+  }
+});
+
 test("wrap pi fails open when no bundled extension exists", async () => {
   const packageCopy = mkdtempSync(join(tmpdir(), "cave-pi-cli-copy-"));
   const copiedDist = join(packageCopy, "dist");
