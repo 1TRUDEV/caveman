@@ -35,6 +35,28 @@ export function parseWindowsNodeShim(source: string): string | null {
   return null;
 }
 
+// npm's cmd-shim forwards a package whose `bin` is a native executable with one
+// bare %*-terminated line and no interpreter in front of it:
+//
+//   "%dp0%\node_modules\@opencode\cli\bin\opencode.exe"   %*
+//
+// Only Node-script and nested-batch wrappers were recognized, so an
+// npm-installed host read as unlaunchable while the same command worked in the
+// user's shell (#1252). Anchoring the match to the whole line is what keeps
+// every existing Node shim on the Node path: those name interpreter and script
+// on one line, so the interpreter can never be taken for the target. The target
+// is launched directly, so no cmd.exe parses the line and no argv is
+// interpolated into it.
+export function parseWindowsExeShim(source: string): string | null {
+  for (const line of source.split(/\r?\n/)) {
+    if (!/%\*/.test(line)) continue;
+    const match = line.match(/^[ \t]*@?"%(?:dp0%|~dp0)\\?([^"\r\n]+\.exe)"[ \t]+%\*[ \t]*$/i)
+      ?? line.match(/^[ \t]*@?"([A-Za-z]:[\\/][^"\r\n]+\.exe)"[ \t]+%\*[ \t]*$/i);
+    if (match) return match[1]!;
+  }
+  return null;
+}
+
 // Accept only a single shim-relative forwarding command, optionally preceded by
 // @echo off. Never evaluate batch syntax or interpolate caller-controlled argv.
 function parseWindowsNestedShim(source: string): string | null {
@@ -42,7 +64,11 @@ function parseWindowsNestedShim(source: string): string | null {
   return match?.[1] ?? null;
 }
 
-function resolveWindowsNodeShim(executable: string, depth = 0, seen = new Set<string>()): string {
+// A resolved shim target plus how to launch it: a Node script needs the current
+// Node binary in front of it, a native executable must be launched as itself.
+type ResolvedShim = { target: string; runtime: "node" | "native" };
+
+function resolveWindowsShim(executable: string, depth = 0, seen = new Set<string>()): ResolvedShim {
   if (depth > 4) throw new Error("Windows command shim nesting too deep");
   const normalized = resolve(executable);
   if (seen.has(normalized.toLowerCase())) throw new Error("Windows command shim cycle");
@@ -56,15 +82,20 @@ function resolveWindowsNodeShim(executable: string, depth = 0, seen = new Set<st
   const nested = parseWindowsNestedShim(source);
   const forwardsToBatch = /"[^"\r\n]+\.(?:cmd|bat)"[ \t]+%\*/i.test(source);
   const jsTarget = forwardsToBatch ? null : parseWindowsNodeShim(source);
-  const child = jsTarget ?? nested;
+  // A wrapper that forwards to another batch file is the nested parser's to
+  // read end to end; never pick an .exe line out of the middle of one.
+  const exeTarget = forwardsToBatch || jsTarget ? null : parseWindowsExeShim(source);
+  const child = jsTarget ?? exeTarget ?? nested;
   if (!child) {
-    throw new Error(`cannot safely launch non-Node Windows command shim: ${normalized}; install a native .exe`);
+    throw new Error(`cannot safely launch non-Node Windows command shim: ${normalized}`);
   }
   const target = /^[A-Za-z]:[\\/]/.test(child)
     ? child
     : resolve(dirname(normalized), ...child.split(/[\\/]+/));
   if (!existsSync(target) || !statSync(target).isFile()) throw new Error(`Windows command shim target is missing: ${target}`);
-  return jsTarget ? target : resolveWindowsNodeShim(target, depth + 1, seen);
+  if (jsTarget) return { target, runtime: "node" };
+  if (exeTarget) return { target, runtime: "native" };
+  return resolveWindowsShim(target, depth + 1, seen);
 }
 
 function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -112,6 +143,8 @@ export function portableInvocation(
   if (platform !== "win32") return { command, args: [...args] };
   const executable = resolveWindowsCommand(command, env) ?? command;
   if (!/\.(?:cmd|bat)$/i.test(executable)) return { command: executable, args: [...args] };
-  const script = resolveWindowsNodeShim(executable);
-  return { command: process.execPath, args: [script, ...args] };
+  const resolved = resolveWindowsShim(executable);
+  return resolved.runtime === "native"
+    ? { command: resolved.target, args: [...args] }
+    : { command: process.execPath, args: [resolved.target, ...args] };
 }
