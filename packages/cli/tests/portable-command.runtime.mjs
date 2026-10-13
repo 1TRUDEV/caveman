@@ -177,6 +177,96 @@ test("pnpm's shim for an .exe bin runs that executable directly", () => {
   }
 });
 
+// #1252: npm's cmd-shim forwards a package whose `bin` is a native executable
+// with one %*-terminated line and no interpreter. The parser understood only
+// Node-script and nested-batch wrappers, so an npm-installed OpenCode read as
+// `version_probe_failed` on Windows — doctor called the host unavailable and
+// refused to enable or repair it, while `opencode --version` worked in the same
+// shell. The advice it printed ("install a native .exe") was already satisfied:
+// the tool IS one, just reached through a shim.
+test("npm .cmd shim forwarding to a native .exe launches the exe directly (#1252)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cave-win-exe-shim-"));
+  try {
+    const exe = join(root, "node_modules", "@opencode", "cli", "bin", "opencode.exe");
+    mkdirSync(dirname(exe), { recursive: true });
+    writeFileSync(exe, "MZ native fixture");
+    const shim = join(root, "opencode.cmd");
+    // Verbatim npm cmd-shim@7 non-Node payload, %dp0% subroutine form and all.
+    writeFileSync(shim, [
+      "@ECHO off",
+      "GOTO start",
+      ":find_dp0",
+      "SET dp0=%~dp0",
+      "EXIT /b",
+      ":start",
+      "SETLOCAL",
+      "CALL :find_dp0",
+      '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*',
+      "",
+    ].join("\r\n"));
+    // No process.execPath in front: a native binary is not a Node script.
+    assert.deepEqual(portableInvocation(shim, ["--version"], "win32"), {
+      command: exe,
+      args: ["--version"],
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Spellings are covered as a pure parse, the way the pnpm cross-drive Node
+// forms are: a drive-absolute target cannot be laid down on a POSIX runner.
+test("parses the native-exe shim spellings and only the bare forwarding form (#1252)", () => {
+  assert.equal(
+    parseWindowsExeShim('@ECHO off\r\nSET dp0=%~dp0\r\n"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*\r\n'),
+    "node_modules\\@opencode\\cli\\bin\\opencode.exe",
+  );
+  assert.equal(parseWindowsExeShim('"%~dp0\\bin\\tool.exe" %*\r\n'), "bin\\tool.exe");
+  assert.equal(parseWindowsExeShim('"%~dp0tool.exe" %*\r\n'), "tool.exe");
+  assert.equal(parseWindowsExeShim('@"D:\\store\\pkg\\bin\\tool.exe" %*\r\n'), "D:\\store\\pkg\\bin\\tool.exe");
+
+  // A Node shim names node.exe on the same line as its script. The anchored
+  // form cannot mistake that interpreter for the forwarding target, which is
+  // what keeps every existing pnpm/npm Node shim on the Node path.
+  assert.equal(parseWindowsExeShim('@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"   "%~dp0\\..\\pkg\\cli.js" %*\r\n)\r\n'), null);
+  assert.equal(parseWindowsExeShim('@"C:\\Program Files\\nodejs\\node.exe"  "%~dp0\\..\\pkg\\cli.js" %*\r\n'), null);
+  // Anything beyond a bare forward stays unrecognized.
+  assert.equal(parseWindowsExeShim('"%~dp0tool.exe" %* & echo unsafe\r\n'), null);
+  assert.equal(parseWindowsExeShim('"%~dp0tool.ps1" %*\r\n'), null);
+  assert.equal(parseWindowsExeShim('"%~dp0tool.exe"\r\n'), null);
+  // `..` is ordinary in a cmd-shim target (the bin dir sits beside the package
+  // tree), exactly as on the Node path, so it must not be treated as suspect.
+  assert.equal(parseWindowsExeShim('"%dp0%\\..\\pkg\\bin\\tool.exe" %*\r\n'), "..\\pkg\\bin\\tool.exe");
+});
+
+test("a native-exe shim that does more than forward still fails closed (#1252)", () => {
+  const root = mkdtempSync(join(tmpdir(), "cave-win-exe-reject-"));
+  try {
+    const exe = join(root, "child.exe");
+    writeFileSync(exe, "MZ native fixture");
+    const shim = join(root, "agent.cmd");
+    const invoke = () => portableInvocation(shim, ["unsafe&arg"], "win32");
+    for (const content of [
+      // Trailing batch syntax on the forwarding line: not a bare forward.
+      '"%~dp0child.exe" %* & echo unsafe\r\n',
+      // Batch forwarding owns the whole wrapper; an .exe line inside one is
+      // never picked out of it (the nested parser must match end to end).
+      '"%~dp0child.bat" %*\r\n"%~dp0child.exe" %*\r\n',
+      // Still not an executable we know how to launch without cmd.exe.
+      '"%~dp0child.ps1" %*\r\n',
+    ]) {
+      writeFileSync(shim, content);
+      assert.throws(invoke, /cannot safely launch non-Node Windows command shim/, content);
+    }
+    // A recognized forward whose target is absent reports THAT, not a parse
+    // failure: the shim is fine, the install is broken.
+    writeFileSync(shim, '"%~dp0missing.exe" %*\r\n');
+    assert.throws(invoke, /Windows command shim target is missing/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // Node's own npm.cmd and npx.cmd (npm 10.9.7, byte for byte): what every
 // Windows Node install puts first on PATH, so `npm`/`npx` resolve to them.
 const NPM_SHIM = (name) => [

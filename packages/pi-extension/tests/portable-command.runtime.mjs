@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const { portableInvocation, parseWindowsNodeShim } = await import("../dist/portable-command.mjs")
+const { portableInvocation, parseWindowsExeShim, parseWindowsNodeShim } = await import("../dist/portable-command.mjs")
   .catch(() => import("../src/portable-command.ts"));
 
 function fixture() {
@@ -108,6 +108,40 @@ test("win32: a real .exe is invoked directly", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// #1252: npm's cmd-shim forwards a package whose `bin` is a native executable
+// with one bare %*-terminated line and no interpreter. The hook bridge resolves
+// `caveman` through this helper, so a natively packaged CLI reached by a .cmd
+// shim was unlaunchable while the same command worked in the user's shell.
+test("win32: a cmd shim forwarding to a native .exe launches the exe itself (#1252)", () => {
+  const { root, bin } = fixture();
+  try {
+    const exe = join(bin, "caveman.exe");
+    writeFileSync(exe, "MZ native fixture");
+    writeFileSync(join(bin, "caveman.CMD"), [
+      "@ECHO off",
+      "SET dp0=%~dp0",
+      '"%dp0%\\caveman.exe"   %*',
+      "",
+    ].join("\r\n"));
+    const r = portableInvocation("caveman", ["native-hook", "pi", "Stop"], "win32", { PATH: bin, PATHEXT: ".CMD" });
+    // No process.execPath: a native binary is not a Node script.
+    assert.equal(r.command, exe);
+    assert.deepEqual(r.args, ["native-hook", "pi", "Stop"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("win32: only the bare .exe forwarding form is recognized (#1252)", () => {
+  assert.equal(parseWindowsExeShim('"%dp0%\\bin\\tool.exe"   %*\r\n'), "bin\\tool.exe");
+  assert.equal(parseWindowsExeShim('@"D:\\store\\tool.exe" %*\r\n'), "D:\\store\\tool.exe");
+  // A Node shim names its interpreter and script on one line; the anchored
+  // match cannot take node.exe for the forwarding target.
+  assert.equal(parseWindowsExeShim('@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"   "%~dp0\\cli.js" %*\r\n)\r\n'), null);
+  assert.equal(parseWindowsExeShim('"%~dp0tool.exe" %* & echo unsafe\r\n'), null);
+  assert.equal(parseWindowsExeShim('"%~dp0tool.ps1" %*\r\n'), null);
 });
 
 test("win32: a shim whose target cannot be parsed throws rather than spawning garbage", () => {
