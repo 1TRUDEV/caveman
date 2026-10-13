@@ -53,7 +53,8 @@ caveman wrap pi      # this session only
 caveman enable pi    # persistent; plain `pi` stays routed until `caveman disable pi`
 ```
 
-Or as a plain Pi package:
+Or as a plain Pi package. Use this or `caveman enable pi`, not both: Pi refuses
+to start when two copies register the same tool.
 
 ```bash
 pi install npm:@caveman-ai/pi

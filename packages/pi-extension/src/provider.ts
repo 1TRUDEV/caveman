@@ -167,7 +167,7 @@ export class ProviderRouter {
       // only provider/id are persisted to session/settings. No provider-wide
       // override or replacement model catalogue is needed.
       const compat = compatForRoutedModel(model);
-      if (!(await this.pi.setModel({ ...model, baseUrl: route, ...(compat === undefined ? {} : { compat }) }))) {
+      if (!(await this.setModelKeepingThinking({ ...model, baseUrl: route, ...(compat === undefined ? {} : { compat }) }))) {
         if (await this.restoreCurrentModel(ctx)) {
           this.notify("Caveman: direct mode, no compression this session (model selection failed)", "warning");
         }
@@ -188,6 +188,16 @@ export class ProviderRouter {
       && model.baseUrl === this.routed.route;
   }
 
+  // Pi's setModel re-derives the thinking level from settings, which would drop
+  // a `--thinking high` or a resumed session's level every time we re-point the
+  // model. Same model, so the level the user had is still valid: put it back.
+  private async setModelKeepingThinking(model: NonNullable<ExtensionContext["model"]>): Promise<boolean> {
+    const level = this.pi.getThinkingLevel?.();
+    const ok = await this.pi.setModel(model);
+    if (ok && level !== undefined) this.pi.setThinkingLevel?.(level);
+    return ok;
+  }
+
   private async restoreCurrentModel(ctx: ExtensionContext): Promise<boolean> {
     const current = ctx.model;
     if (!this.isOwnedRoute(current)) {
@@ -201,7 +211,7 @@ export class ProviderRouter {
     const wasApplying = this.applying;
     this.applying = true;
     try {
-      if (await this.pi.setModel(direct)) {
+      if (await this.setModelKeepingThinking(direct)) {
         this.routed = undefined;
         return true;
       }

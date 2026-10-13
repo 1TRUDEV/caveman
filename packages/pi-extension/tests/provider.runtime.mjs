@@ -75,6 +75,34 @@ test("route only the selected model; a same-provider foreign endpoint stays dire
   assert.deepEqual(h.registry, MODELS);
 });
 
+// Pi's setModel re-derives thinking from settings; routing must not cost the
+// user the level they started the session with.
+test("routing and restoring keep the session's thinking level", async () => {
+  let level = "high";
+  let active = { ...MODELS[0] };
+  const ctx = {
+    get model() { return active; },
+    modelRegistry: {
+      getAll: () => MODELS,
+      find: (provider, id) => MODELS.find((model) => model.provider === provider && model.id === id),
+      isUsingOAuth: () => false,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-local-test-key" }),
+    },
+  };
+  const pi = {
+    getThinkingLevel: () => level,
+    setThinkingLevel: (value) => { level = value; },
+    async setModel(model) { active = model; level = "low"; return true; },
+  };
+  const router = new ProviderRouter(pi, () => {});
+  await router.openGate(GATEWAY, ctx, COMPAT, NATIVE);
+  assert.equal(active.baseUrl, ROUTE);
+  assert.equal(level, "high", "routing reset the thinking level");
+  await router.closeGate(ctx);
+  assert.equal(active.baseUrl, MODELS[0].baseUrl);
+  assert.equal(level, "high", "restoring direct mode reset the thinking level");
+});
+
 test("provider switches and closeGate preserve registry and restore active endpoint", async () => {
   const models = [...MODELS, { provider: "openai", id: "gpt-fixture", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }];
   const h = harness(models);

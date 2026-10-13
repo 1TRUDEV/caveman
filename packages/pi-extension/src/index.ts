@@ -224,18 +224,20 @@ export default function (pi: ExtensionAPI) {
     if (gateDone) await router?.apply(event.model, ctx);
   }));
 
-  pi.on("before_agent_start", GUARD_before_agent_start(async (event: { prompt: string; systemPrompt: string }, ctx: ExtensionContext) => {
+  pi.on("before_agent_start", GUARD_before_agent_start(async (event: { prompt?: string; systemPrompt: string }, ctx: ExtensionContext) => {
     // Provider registration changes can refresh Pi's active model without a
     // model_select event. Recheck that current object before every new turn.
     if (gateDone) await router?.apply(ctx.model, ctx);
+    // Pi 1.1+ also fires this for extension-sent custom messages, which carry no prompt.
+    const prompt = event.prompt ?? "";
     const response = await bridge.call("UserPromptSubmit", {
       session_id: sessionId,
       model: ctx.model?.id,
       provider: ctx.model?.provider,
-      prompt: promptDigest(event.prompt),
-      task_type: taskType(event.prompt),
-      task_terms: taskTerms(event.prompt),
-      task_continuation: taskContinuation(event.prompt),
+      prompt: promptDigest(prompt),
+      task_type: taskType(prompt),
+      task_terms: taskTerms(prompt),
+      task_continuation: taskContinuation(prompt),
     });
     const dynamic = [additionalContextOf(response), ...pendingContext].filter(Boolean) as string[];
     pendingContext = [];
