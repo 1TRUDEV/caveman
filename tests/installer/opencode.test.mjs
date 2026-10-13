@@ -505,6 +505,10 @@ test('opencode plugin handles /caveman ultra, /megacave, stop caveman, and sessi
     // ignores unrelated event types.
     await handlers.event({ event: { type: 'session.idle' } });
     assert.equal(fs.existsSync(flagPath), false, 'non-session.created event must not write the flag');
+    // A subagent's session must not reset the mode the user chose.
+    await handlers.event({ event: { type: 'session.created', properties: { info: { parentID: 'ses_parent' } } } });
+    await handlers.event({ event: { type: 'session.created', data: { sessionID: 'ses_child', parentID: 'ses_parent' } } });
+    assert.equal(fs.existsSync(flagPath), false, 'a child session must not re-activate caveman after "stop caveman"');
     await handlers.event({ event: { type: 'session.created' } });
     assert.equal(fs.readFileSync(flagPath, 'utf8'), 'caveman');
     const sessionInitRows = fs.readFileSync(modeLogPath, 'utf8').trim().split('\n').map(JSON.parse);
@@ -566,6 +570,7 @@ test('opencode 2.x loads server.js: session init, prompt mode changes and contex
       event: {
         subscribe: async function* () {
           yield { type: 'session.created', data: { sessionID: 'ses_1' } };
+          yield { type: 'session.created', data: { sessionID: 'ses_child', parentID: 'ses_1' } };
           delivered();
         },
       },
@@ -583,6 +588,9 @@ test('opencode 2.x loads server.js: session init, prompt mode changes and contex
     await prompt('/ultracave');
     assert.equal(fs.readFileSync(flagPath, 'utf8'), 'ultracave');
     assert.equal(await prompt('/caveman status'), 'Report this status verbatim without changing mode: Caveman mode: ultracave');
+    // A subagent's prompt is written by the model; it must not switch the mode.
+    await hooks.prompt({ sessionID: 'ses_child', prompt: { text: 'stop caveman' } });
+    assert.equal(fs.readFileSync(flagPath, 'utf8'), 'ultracave', 'a subagent prompt changed the mode');
 
     const context = { sessionID: 'ses_1', system: [{ type: 'text', text: 'host prompt' }] };
     await hooks.context(context);
