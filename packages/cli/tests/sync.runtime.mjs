@@ -155,6 +155,33 @@ test("sync without login exits non-zero with a login hint", async () => {
   assert.match(out.stderr, /caveman login/, "must hint at `caveman login`");
 });
 
+// A store larger than the import endpoint's body cap uploads in batches, and
+// the SQLite experimental warning never reaches the terminal.
+test("sync splits a large backlog into batches under the body cap", async () => {
+  const { server, imports } = startImportStub();
+  const port = await listen(server);
+  const home = mkdtempSync(join(tmpdir(), "cave-home-"));
+  const caveDir = mkdtempSync(join(tmpdir(), "cave-dot-"));
+  const env = { ...process.env, HOME: home, CAVEMAN_HOME: caveDir, CAVE_TOKEN: "ci-token", CAVE_API_URL: `http://127.0.0.1:${port}`, CAVEMAN_SYNC_MAX_BATCH_BYTES: "1500" };
+
+  const { db, insert } = makeSpendDb(caveDir);
+  for (let i = 1; i <= 7; i++) insert(`req-${i}`, 1000, 400);
+  db.close();
+
+  const out = await runCli(["sync"], env);
+  assert.equal(out.code, 0, `sync failed: ${out.stderr}`);
+  assert.match(out.stdout, /synced 7 spans/);
+  assert.doesNotMatch(out.stderr, /ExperimentalWarning/);
+  assert.ok(imports.length > 1, "a backlog over the cap must take more than one POST");
+  for (const post of imports) assert.ok(Buffer.byteLength(post.body) <= 1500, "every batch stays under the cap");
+  assert.deepEqual(
+    imports.flatMap((post) => post.body.trim().split("\n").map((line) => JSON.parse(line).span_id)),
+    [1, 2, 3, 4, 5, 6, 7].map((i) => `req-${i}`),
+    "every span is uploaded exactly once, in order",
+  );
+  server.close();
+});
+
 // Happy path + idempotency: first sync uploads all local spans as caveman-jsonl
 // (labeled inferred), a second sync is a no-op (watermark), and new local rows
 // sync incrementally — never re-uploading what the server already accepted.

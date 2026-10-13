@@ -18,9 +18,13 @@ export default {
   async setup(ctx) {
     const hooks = await CavemanPlugin(ctx);
 
+    // Subagent sessions: their prompts are written by the model, so they must
+    // not switch the user's mode.
+    const children = new Set();
     const controller = new AbortController();
     (async () => {
       for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        if (event?.type === 'session.created' && event.data?.parentID) children.add(event.data.sessionID);
         await hooks.event({ event });
       }
     })().catch(() => {});
@@ -28,6 +32,7 @@ export default {
     // The prompt text is mutable; plugin.js rewrites it for /caveman status.
     await ctx.session.hook('prompt', async (event) => {
       if (!event.prompt || typeof event.prompt.text !== 'string') return;
+      if (children.has(event.sessionID)) return;
       const part = { type: 'text', text: event.prompt.text };
       await hooks['chat.message']({}, { parts: [part] });
       event.prompt.text = part.text;

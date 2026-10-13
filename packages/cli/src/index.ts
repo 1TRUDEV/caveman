@@ -4567,37 +4567,39 @@ function proxyYamlMode(): unknown {
 // already set, and never asserts when the upstream cannot be verified.
 const CLAUDE_ASSUME_FIRST_PARTY_ENV = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL";
 
-// yamlProviderBaseUrl scans an indentation-nested `providers.<name>.base_url`
-// key without a YAML dependency (the published CLI has zero runtime deps).
-// Returns the value when found, null when the providers/<name> block or key is
-// absent, and undefined when the document uses a shape the scan cannot follow
-// (flow-style `{...}` blocks) — callers must treat undefined as unverifiable.
-function yamlProviderBaseUrl(raw: string, provider: string): string | null | undefined {
+// yamlScopedBaseUrl scans an indentation-nested `<group>.<name>.base_url` key
+// without a YAML dependency (the published CLI has zero runtime deps). Returns
+// the value when found, null when the group/<name> block or key is absent, and
+// undefined when the document uses a shape the scan cannot follow (flow-style
+// `{...}` blocks) — callers must treat undefined as unverifiable. `providers`
+// answers which upstream the proxy forwards to; `compat` answers whether a
+// user-defined mount exists at all (#1254).
+function yamlScopedBaseUrl(raw: string, group: string, name: string): string | null | undefined {
   const lines = raw.split(/\r?\n/);
-  let providersIndent = -1;
-  let providerIndent = -1;
+  let groupIndent = -1;
+  let nameIndent = -1;
   for (const line of lines) {
     const code = line.split("#", 1)[0]!;
     if (!code.trim()) continue;
     const indent = code.length - code.trimStart().length;
     const keyMatch = code.trim().match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (providersIndent !== -1 && indent <= providersIndent) providersIndent = -1;
-    if (providerIndent !== -1 && indent <= providerIndent) providerIndent = -1;
+    if (groupIndent !== -1 && indent <= groupIndent) groupIndent = -1;
+    if (nameIndent !== -1 && indent <= nameIndent) nameIndent = -1;
     if (!keyMatch) continue;
     const key = keyMatch[1]!;
     const rest = keyMatch[2] ?? "";
     if (rest.startsWith("{") || rest.startsWith("[")) {
-      // Flow-style collections keep their children on this line; a providers
+      // Flow-style collections keep their children on this line; a group
       // subtree written that way is beyond this scan, so report unverifiable.
-      if (key === "providers" || providersIndent !== -1) return undefined;
+      if (key === group || groupIndent !== -1) return undefined;
       continue;
     }
-    if (providerIndent !== -1 && key === "base_url") {
+    if (nameIndent !== -1 && key === "base_url") {
       const value = rest.replace(/^["']|["']\s*$/g, "").trim();
       return value || null;
     }
-    if (providersIndent !== -1 && key === provider && providerIndent === -1) providerIndent = indent;
-    else if (key === "providers" && providersIndent === -1 && providerIndent === -1 && indent === 0) providersIndent = indent;
+    if (groupIndent !== -1 && key === name && nameIndent === -1) nameIndent = indent;
+    else if (key === group && groupIndent === -1 && nameIndent === -1 && indent === 0) groupIndent = indent;
   }
   return null;
 }
@@ -4621,7 +4623,7 @@ function proxyUpstreamIsFirstParty(provider: string, host: string): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException)?.code === "ENOENT";
   }
-  const override = yamlProviderBaseUrl(raw, provider);
+  const override = yamlScopedBaseUrl(raw, "providers", provider);
   if (override === undefined) return false;
   if (override === null) return true;
   try {
@@ -5464,6 +5466,17 @@ function refreshWrapEntitlementInBackground(options: { wrappedRun?: boolean } = 
     }
   })().catch(() => {
     /* never surface a background rejection */
+  });
+}
+
+// The refresh outcome and the weekly run claim belong to the credential they ran
+// under. Login and logout replace that credential, so they drop both: native
+// wiring never runs the background refresh, and a stale failure would keep
+// status on "account refresh offline" for good.
+function dropWrapRefreshState() {
+  mutateRawConfig((out) => {
+    delete out.wrapEntitlementRefresh;
+    delete out.wrapEntitlementRunRefreshWeek;
   });
 }
 
@@ -9010,6 +9023,10 @@ function call(event, payload = {}) {
       encoding: "utf8",
       timeout: 2000,
       maxBuffer: 2 * 1024 * 1024,
+      // A host with no console of its own — OpenCode under a multiplexer or a
+      // GUI launcher — makes Windows give every console child a NEW console
+      // window, so the user sees one flash per event. Ignored off Windows.
+      windowsHide: true,
     });
     if (!raw.trim()) return undefined;
     const value = JSON.parse(raw);
@@ -9131,6 +9148,7 @@ export const CavemanNative = async () => ({
         input: JSON.stringify({ tool_name: "Bash", tool_input: { command: output.args.command } }),
         encoding: "utf8",
         timeout: 750,
+        windowsHide: true,
       });
       const rewritten = JSON.parse(raw)?.hookSpecificOutput?.updatedInput?.command;
       if (typeof rewritten === "string" && rewritten) output.args.command = rewritten;
@@ -9181,6 +9199,10 @@ function call(event, payload = {}) {
       encoding: "utf8",
       timeout: 2000,
       maxBuffer: 2 * 1024 * 1024,
+      // A host with no console of its own — OpenCode under a multiplexer or a
+      // GUI launcher — makes Windows give every console child a NEW console
+      // window, so the user sees one flash per event. Ignored off Windows.
+      windowsHide: true,
     });
     if (!raw.trim()) return undefined;
     const value = JSON.parse(raw);
@@ -9337,6 +9359,7 @@ export default {
             input: JSON.stringify({ tool_name: "Bash", tool_input: { command: input.command } }),
             encoding: "utf8",
             timeout: 750,
+            windowsHide: true,
           });
           const rewritten = JSON.parse(raw)?.hookSpecificOutput?.updatedInput?.command;
           if (typeof rewritten === "string" && rewritten) input.command = rewritten;
@@ -9381,26 +9404,98 @@ function opencodeNativeRoutes(gw: string): Record<string, string> {
   };
 }
 
-// Only the journaled providers reach the proxy. Anything else (GitHub Copilot,
-// Zen) goes direct while the install reads healthy (#1190), so name it. Global
-// config only, the same file enable edits; a project opencode.json can still
-// pick another model.
-function opencodeUnroutedActiveProvider(routed: string[]): string | null {
+// proxyCompatMount answers whether the local proxy serves a user-defined
+// compat mount of this name: the value when caveman.yaml declares one, null
+// when it demonstrably does not, and undefined when the file cannot be read or
+// uses a shape the scan cannot follow.
+function proxyCompatMount(name: string): string | null | undefined {
+  const path = process.env.CAVEMAN_CONFIG ?? join(cavemanHome(), "caveman.yaml");
+  try {
+    return yamlScopedBaseUrl(readFileSync(path, "utf8"), "compat", name);
+  } catch {
+    return undefined;
+  }
+}
+
+// opencodeBaseUrlRouting reads a provider's configured endpoint and answers
+// where its requests actually go. #1190 asked the install journal, which holds
+// only the three routes `enable` writes, so a provider the user routed by hand
+// — baseURL pointed at the gateway's own /w/opencode wedge — was reported as
+// going direct and "not compressed or counted" while the proxy was recording
+// every one of its requests (#1254). The endpoint is the evidence; the name
+// never was.
+//
+// Origin plus the wedge prefix is the whole test, which covers the built-in
+// /openai/v1 and /anthropic/v1 paths and any deeper one without enumerating
+// them. A /compat/<name>/ path needs its mount to exist as well: without one
+// the request still reaches the proxy and 404s, which is a different problem
+// with a different remedy, so it is reported as the missing mount rather than
+// as going direct.
+function opencodeBaseUrlRouting(
+  baseUrl: unknown,
+  gw: string,
+): { routed: true } | { routed: false; mount: string } | null {
+  if (typeof baseUrl !== "string" || !baseUrl) return null;
+  let endpoint: URL;
+  let wedge: URL;
+  try {
+    endpoint = new URL(baseUrl);
+    wedge = new URL(appendUrlPath(gw, "/w/opencode"));
+  } catch {
+    return null;
+  }
+  if (endpoint.origin !== wedge.origin) return null;
+  const prefix = wedge.pathname.replace(/\/+$/, "");
+  const path = endpoint.pathname.replace(/\/+$/, "");
+  if (path !== prefix && !path.startsWith(`${prefix}/`)) return null;
+  const mount = path.slice(prefix.length).match(/^\/compat\/([^/]+)/);
+  if (!mount) return { routed: true };
+  const name = decodeURIComponent(mount[1]!);
+  // Only a readable config that demonstrably lacks the mount is evidence of
+  // one missing. Unverifiable must not bring the false alarm back in another
+  // spelling: the endpoint already proves these requests are not going direct.
+  return proxyCompatMount(name) === null ? { routed: false, mount: name } : { routed: true };
+}
+
+// Only the journaled providers reach the proxy by default. Anything else
+// (GitHub Copilot, Zen) goes direct while the install reads healthy (#1190), so
+// name it — unless the user routed it themselves (#1254). Global config only,
+// the same file enable edits; a project opencode.json can still pick another
+// model.
+function opencodeUnroutedActiveProvider(
+  routed: string[],
+  gw: string,
+): { provider: string; mount: string | null } | null {
+  const configs: Record<string, unknown>[] = [];
   for (const name of ["opencode.jsonc", "opencode.json"]) {
     try {
-      const model = (parseJsonc(readFileSync(join(opencodeConfigDir(), name), "utf8")) as Record<string, unknown> | null)?.model;
-      if (typeof model === "string" && model.includes("/")) {
-        const provider = model.slice(0, model.indexOf("/"));
-        return routed.includes(provider) ? null : provider;
-      }
+      configs.push(objectValue(parseJsonc(readFileSync(join(opencodeConfigDir(), name), "utf8"))));
     } catch { /* missing or unreadable: try the next source */ }
+  }
+  const verdict = (provider: string): { provider: string; mount: string | null } | null => {
+    if (routed.includes(provider)) return null;
+    // Every candidate config is consulted before answering, so a routed
+    // endpoint in one is never shadowed by a missing mount named in another.
+    let missing: string | null = null;
+    for (const config of configs) {
+      const routing = opencodeBaseUrlRouting(objectValue(objectValue(objectValue(config.provider)[provider]).options).baseURL, gw);
+      if (routing?.routed === true) return null;
+      if (routing?.routed === false) missing ??= routing.mount;
+    }
+    return { provider, mount: missing };
+  };
+  for (const config of configs) {
+    const model = config.model;
+    if (typeof model === "string" && model.includes("/")) return verdict(model.slice(0, model.indexOf("/")));
   }
   // No model pinned: OpenCode picks among signed-in providers, so only a
   // sign-in set with no routed provider at all is a sure miss.
   try {
     const dataRoot = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
     const signedIn = Object.keys(JSON.parse(readFileSync(join(dataRoot, "opencode", "auth.json"), "utf8")) ?? {});
-    return signedIn.length > 0 && !signedIn.some((id) => routed.includes(id)) ? signedIn[0]! : null;
+    if (signedIn.length === 0) return null;
+    const verdicts = signedIn.map((id) => verdict(id));
+    return verdicts.every((item) => item !== null) ? verdicts[0]! : null;
   } catch {
     return null;
   }
@@ -9467,11 +9562,15 @@ function opencodeNativeMutations(gw: string, mcpBinary: string, plan = false): N
   ];
 }
 
+// Pi's extension auto-discovery accepts only .ts/.js (isExtensionFile in
+// pi-coding-agent 0.84.2); a .mjs here would journal fine and never load.
+function piNativeExtensionPath(): string {
+  return join(homedir(), ".pi", "agent", "extensions", "caveman-native.js");
+}
+
 function piNativeMutations(): NativeMutation[] {
-  const extensionDir = join(homedir(), ".pi", "agent", "extensions");
-  // Pi's extension auto-discovery accepts only .ts/.js (isExtensionFile in
-  // pi-coding-agent 0.84.2); a .mjs here would journal fine and never load.
-  const extensionPath = join(extensionDir, "caveman-native.js");
+  const extensionPath = piNativeExtensionPath();
+  const extensionDir = dirname(extensionPath);
   const before = fileBytes(extensionPath);
   if (before && !before.toString("utf8").includes("caveman:native-pi")) {
     throw new Error(`${extensionPath} already exists and is not Caveman-owned; refusing to overwrite it`);
@@ -9830,6 +9929,11 @@ import subprocess
 
 _CAVEMAN_CMD = ${JSON.stringify(cmd)}
 _CAVEMAN_PRE = ${JSON.stringify(pre)}
+# A Hermes host with no console of its own makes Windows give every console
+# child a NEW console window, so the user sees one flash per hook call.
+# subprocess ignores Node's windowsHide, and CREATE_NO_WINDOW is absent off
+# Windows, so resolve it at run time and pass 0 everywhere else (#1214).
+_CAVEMAN_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _digest(value):
@@ -9903,6 +10007,7 @@ def _call(event, payload=None):
             text=True,
             capture_output=True,
             timeout=1,
+            creationflags=_CAVEMAN_NO_WINDOW,
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             return None
@@ -11310,8 +11415,15 @@ function nativeIntegrationStatus(agent: NativeAgent, { probe = true }: { probe?:
   }
   if (agent === "opencode" && installed) {
     const routed = Object.keys((routeOperation?.owned?.routes as Record<string, unknown> | undefined) ?? {});
-    const unrouted = opencodeUnroutedActiveProvider(routed);
-    if (unrouted) warnings.push(`OpenCode's active provider "${unrouted}" is not routed through Caveman; its requests go direct and are not compressed or counted (routed: ${routed.join(", ")})`);
+    const unrouted = opencodeUnroutedActiveProvider(routed, gatewayURL());
+    if (unrouted?.mount) {
+      // Already pointed at the proxy, just at a mount the proxy does not
+      // serve: those requests reach Caveman and 404, so naming the mount is
+      // the remedy, not "it goes direct" (#1254).
+      warnings.push(`OpenCode's active provider "${unrouted.provider}" points at the Caveman compat mount "${unrouted.mount}", which the local proxy does not serve; add compat.${unrouted.mount}.base_url to caveman.yaml so those requests can be forwarded`);
+    } else if (unrouted) {
+      warnings.push(`OpenCode's active provider "${unrouted.provider}" is not routed through Caveman; its requests go direct and are not compressed or counted (routed: ${routed.join(", ")})`);
+    }
   }
   for (const root of unwiredProfiles) warnings.push(`Claude profile ${root} is not routed through Caveman; run \`caveman enable claude\``);
   const own = installed ? agentOwnEndpoint(agent) : null;
@@ -11585,6 +11697,7 @@ function shrinkText(text) {
     input: text,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
+    windowsHide: true,
   });
   return typeof out === "string" && out.trim() ? out : "";
 }
@@ -12493,6 +12606,7 @@ async function login(argv: string[] = [], ui?: SignInUi): Promise<{ email?: stri
   // credential. Do not print authenticated success or continue the post-login
   // bridge until the control plane has recorded that this CLI stored the bundle.
   await saveConfig(saved);
+  dropWrapRefreshState();
   await grant.acknowledge();
   syncAutoEntries();
   // The first-run screen says these its own way.
@@ -12575,6 +12689,7 @@ async function logout() {
 	await saveConfig({ ...cfg, logoutPendingLocalCleanup: true });
   clearToken(cfg.tokenStore);
   await saveConfig({ baseURL: "", token: "" });
+  dropWrapRefreshState();
   syncAutoEntries();
   print({ logged_out: true });
 }
@@ -13075,12 +13190,22 @@ async function syncLocalSavings(cfg: Config): Promise<SyncOutcome> {
   // node:sqlite is built into Node ≥22.13 — still zero runtime deps. Imported
   // lazily so only sync paths ever load it (or pay its experimental warning).
   let DatabaseSync: (typeof import("node:sqlite"))["DatabaseSync"];
+  // Node 22-23 print "ExperimentalWarning: SQLite is an experimental feature"
+  // on first load; drop that one line rather than show it on every sync.
+  const emitWarning = process.emitWarning;
+  process.emitWarning = ((warning: unknown, ...rest: unknown[]) => {
+    const type = typeof rest[0] === "string" ? rest[0] : (rest[0] as { type?: string } | undefined)?.type;
+    if (type === "ExperimentalWarning" && /SQLite/.test(String((warning as Error)?.message ?? warning))) return;
+    (emitWarning as (...args: unknown[]) => void).call(process, warning, ...rest);
+  }) as typeof process.emitWarning;
   try {
     ({ DatabaseSync } = await import("node:sqlite"));
   } catch {
     throw new Error(
       `caveman sync requires Node >= 22.13 (it reads the local spend store via node:sqlite); you are running Node ${process.versions.node}`,
     );
+  } finally {
+    process.emitWarning = emitWarning;
   }
   const db = new DatabaseSync(dbPath, { readOnly: true });
   let rows: Record<string, unknown>[];
@@ -13154,24 +13279,39 @@ async function syncLocalSavings(cfg: Config): Promise<SyncOutcome> {
       if (!Number.isFinite(ms)) return [];
       return directiveInstalls.filter((d) => ms >= d.installedAtMs).map((d) => d.id);
     };
-    const body = rows.map((r) => syncRequestSpan(r, rowDirectives(r))).join("\n") + "\n";
-    const response = await fetch(`${cfg.baseURL}/api/v1/imports?format=caveman-jsonl`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${cfg.token}`,
-        "content-type": "application/octet-stream",
-        "x-cave-csrf": "cli",
-      },
-      body,
-    });
-    const result = (await response.json().catch(() => ({}))) as { status?: string; error?: { message?: string } };
-    if (!response.ok || result.status !== "completed") {
-      throw new Error(result.error?.message ?? `sync import failed (${response.status})`);
-    }
-
     const num = (v: unknown) => (typeof v === "bigint" ? Number(v) : typeof v === "number" && Number.isFinite(v) ? v : 0);
-    const maxId = rows.reduce((m, r) => Math.max(m, num(r.id)), since);
-    writeSyncWatermark(key, maxId);
+    // The import endpoint caps a body at 16 MiB, and a long-unsynced store is
+    // larger than that. Upload in id order in batches under the cap, moving the
+    // watermark after each, so a failed batch keeps the ones before it.
+    const maxBytes = Number(process.env.CAVEMAN_SYNC_MAX_BATCH_BYTES) || 8 << 20;
+    for (let start = 0; start < rows.length;) {
+      let body = "";
+      let bytes = 0;
+      let end = start;
+      while (end < rows.length) {
+        const line = syncRequestSpan(rows[end]!, rowDirectives(rows[end]!)) + "\n";
+        const size = Buffer.byteLength(line);
+        if (body && bytes + size > maxBytes) break;
+        body += line;
+        bytes += size;
+        end++;
+      }
+      const response = await fetch(`${cfg.baseURL}/api/v1/imports?format=caveman-jsonl`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${cfg.token}`,
+          "content-type": "application/octet-stream",
+          "x-cave-csrf": "cli",
+        },
+        body,
+      });
+      const result = (await response.json().catch(() => ({}))) as { status?: string; error?: { message?: string } };
+      if (!response.ok || result.status !== "completed") {
+        throw new Error(result.error?.message ?? `sync import failed (${response.status})`);
+      }
+      writeSyncWatermark(key, num(rows[end - 1]!.id));
+      start = end;
+    }
     const tokensSaved = rows.reduce((sum, r) => sum + Math.max(0, num(r.compression_tokens_before) - num(r.compression_tokens_after)), 0);
     const tokenBases = new Set(rows.map((r) => (typeof r.compression_token_count_basis === "string" ? r.compression_token_count_basis : "")).filter(Boolean));
     const tokenCountBasis = tokenBases.size === 0 ? "unavailable" : tokenBases.size === 1 ? [...tokenBases][0] ?? "unavailable" : "mixed";
@@ -13689,6 +13829,14 @@ function buildPiWrapArgs(cmdArgs: string[], env: NodeJS.ProcessEnv, gw: string):
   const { cmd, pre } = cavemanInvocation();
   env.CAVEMAN_PI_HOOK_CMD = JSON.stringify([cmd, ...pre]);
   env.CAVE_GATEWAY_URL = gw;
+  // After `caveman enable pi`, Pi already auto-loads the owned copy. A second
+  // copy registers caveman_retrieve twice, which Pi treats as a fatal startup
+  // error, so the session-only copy stays out.
+  // Only when Pi will really load it: a Caveman-owned file, in the directory Pi
+  // reads, with discovery left on. Otherwise the session copy is the only one.
+  const owned = fileBytes(piNativeExtensionPath())?.toString("utf8").includes("caveman:native-pi");
+  const discovery = !env.PI_CODING_AGENT_DIR && !cmdArgs.some((arg) => arg === "--no-extensions" || arg === "-ne");
+  if (owned && discovery) return cmdArgs;
   // The profile's injection block declares the loader flag; using it here keeps the
   // compiled registry the single source of truth for how the asset is loaded.
   const profile = AGENTS.find((a) => a.id === "pi");
@@ -17933,6 +18081,7 @@ export const CavemanShrink = async () => ({
       const res = execFileSync(${JSON.stringify(cmd)}, ${argv}, {
         input: JSON.stringify({ tool_name: "Bash", tool_input: { command } }),
         encoding: "utf8",
+        windowsHide: true,
       });
       if (!res) return;
       const rewritten = JSON.parse(res)?.hookSpecificOutput?.updatedInput?.command;
@@ -18005,6 +18154,11 @@ import subprocess
 
 _CAVEMAN_CMD = ${JSON.stringify(cmd)}
 _CAVEMAN_PRE = ${JSON.stringify(pre)}
+# A Hermes host with no console of its own makes Windows give every console
+# child a NEW console window, so the user sees one flash per hook call.
+# subprocess ignores Node's windowsHide, and CREATE_NO_WINDOW is absent off
+# Windows, so resolve it at run time and pass 0 everywhere else (#1214).
+_CAVEMAN_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _argv(*tail):
@@ -18029,6 +18183,7 @@ def _eligible(command):
             text=True,
             capture_output=True,
             timeout=10,
+            creationflags=_CAVEMAN_NO_WINDOW,
         )
         return proc.returncode == 0 and bool((proc.stdout or "").strip())
     except Exception:
@@ -18052,6 +18207,7 @@ def _transform_terminal_output(command=None, output=None, **kwargs):
             text=True,
             capture_output=True,
             timeout=_int_env("CAVE_HERMES_SHRINK_TIMEOUT_SECONDS", 60),
+            creationflags=_CAVEMAN_NO_WINDOW,
         )
         if proc.returncode != 0 or not proc.stdout:
             return None

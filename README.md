@@ -152,7 +152,7 @@ claude plugin marketplace add JuliusBrussee/caveman && claude plugin install cav
 gemini extensions install https://github.com/JuliusBrussee/caveman
 
 # Every agent on your machine at once, plus the Claude Code statusline badge (Node.js 22.13+)
-curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.0.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.0.1/install.sh | bash
 ```
 
 Already inside Claude Code? Same rock, slash form. Type these where you talk to Claude:
@@ -165,11 +165,11 @@ Already inside Claude Code? Same rock, slash form. Type these where you talk to 
 Windows, PowerShell 5.1+:
 
 ```powershell
-irm https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.0.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.0.1/install.ps1 | iex
 ```
 
 On npm 12 or newer, new npm block git install. One-liners above handle it themselves from v3.2.0 on. Old one-liner pinned to v3.1.0 or older still fail there: use one above, or this:
-`npx --allow-git=root -y github:JuliusBrussee/caveman#v4.0.0`
+`npx --allow-git=root -y github:JuliusBrussee/caveman#v4.0.1`
 
 Changed your mind: `npx -y github:JuliusBrussee/caveman -- --uninstall` (on npm 12+, add `--allow-git=root` too)
 
@@ -235,7 +235,7 @@ caveman-blocks scan    # what your agents retyped this month. Script text never 
 caveman-blocks init    # rules and block index into this repo's AGENTS.md
 ```
 
-Pre-release (v0.1.0-rc.4). Python only, no sandbox yet. Own repo, own stars: **[caveman-ai/blocks](https://github.com/caveman-ai/blocks)**
+Pre-release (v0.1.0-rc.5). Python only, no sandbox yet. Own repo, own stars: **[caveman-ai/blocks](https://github.com/caveman-ai/blocks)**
 
 ## Smaller rocks
 
@@ -323,7 +323,7 @@ Started as a joke in April 2026. Now past 100,000 stars. Joke got serious. Voice
 
 ## Privacy
 
-- **The skill** runs on your machine and sends nothing.
+- **The skill** runs on your machine and sends nothing. One exception: `/caveman-compress` sends the file you compress to your configured model provider.
 - **The CLI** sends usage stats by default: commands run, token counts, caveman-blocks commands and usage counts, a random install ID, OS, and IP. Never your prompts, code, file paths, or scripts you wrote. One person maintains this for free, and those stats show what to build next. Off for good, Blocks included: `caveman telemetry off` or `DO_NOT_TRACK=1`.
 - **Auto**, only once you sign in and pick it: each ask sends Caveman Cloud your latest ask (with whatever your agent attaches to it, such as CLAUDE.md, memory or @-mentioned files), the one before it, and the end of the agent's last reply, plus each request's tool names, effort, a few agent headers, and the previous request's token counts. On the Free plan Caveman may keep it to improve routing. `caveman off routing` stops it.
 - **Where requests go:** from your machine to your provider, or to another provider you added with `caveman providers add`, on your own key. Only a request routed to a Caveman Cloud model passes through Caveman Cloud, whole (system prompt, tool results, code), on your Caveman project's stored key, billed to that project. `caveman providers cloud off` stops that.
