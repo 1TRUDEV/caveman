@@ -1419,6 +1419,87 @@ test("doctor and status warn when OpenCode's active provider is not routed (#119
   assert.deepEqual(JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings, []);
 });
 
+// #1254: the routed set is read from the install journal, which holds only the
+// three routes `enable` writes. A provider the user routed by hand — baseURL
+// pointed at the gateway's own /w/opencode compat mount, with the matching
+// mount in caveman.yaml — was therefore reported as going direct and
+// "not compressed or counted", while the proxy's own request table showed
+// every one of its calls. Same shape as #1212 on the pi extension: the check
+// looked at the provider NAME and never at where it actually sends requests.
+test("an OpenCode provider routed by hand through a compat mount is not called unrouted (#1254)", async () => {
+  const fx = fixture();
+  const env = { ...fx.env, XDG_DATA_HOME: join(fx.home, ".local", "share") };
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  const configPath = join(configDir, "opencode.json");
+  writeFileSync(configPath, JSON.stringify({}) + "\n");
+  assert.equal((await run(["enable", "opencode"], env)).code, 0);
+
+  // The reporter's setup: one signed-in provider, no model pinned, baseURL on
+  // the gateway's compat mount, and that mount declared in caveman.yaml.
+  mkdirSync(join(fx.home, ".local", "share", "opencode"), { recursive: true });
+  writeFileSync(join(fx.home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ "ollama-cloud": { type: "api" } }));
+  writeFileSync(join(fx.home, ".caveman", "caveman.yaml"), "compat:\n  ollama-cloud:\n    base_url: https://ollama.com/v1\n");
+
+  const routedThroughMount = (baseURL) => {
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.provider["ollama-cloud"] = { options: { baseURL } };
+    delete config.model;
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  };
+
+  routedThroughMount("http://127.0.0.1:8787/w/opencode/compat/ollama-cloud/v1");
+  const doctor = JSON.parse((await run(["doctor", "opencode"], env)).stdout);
+  assert.equal(doctor.state, "installed");
+  assert.deepEqual(doctor.warnings, [], "a provider pointed at its own compat mount IS routed");
+
+  // A pinned model reaches the other branch of the same check.
+  const pinned = JSON.parse(readFileSync(configPath, "utf8"));
+  pinned.model = "ollama-cloud/qwen3-coder:480b";
+  writeFileSync(configPath, JSON.stringify(pinned, null, 2) + "\n");
+  assert.deepEqual(JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings, []);
+
+  // The built-in wedge paths enable itself writes are routed for the same
+  // reason, whatever name the user filed them under.
+  routedThroughMount("http://127.0.0.1:8787/w/opencode/openai/v1");
+  assert.deepEqual(JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings, []);
+});
+
+test("OpenCode providers that really do go direct still warn (#1254 keeps #1190)", async () => {
+  const fx = fixture();
+  const env = { ...fx.env, XDG_DATA_HOME: join(fx.home, ".local", "share") };
+  const configDir = join(fx.home, ".config", "opencode");
+  mkdirSync(configDir, { recursive: true });
+  const configPath = join(configDir, "opencode.json");
+  writeFileSync(configPath, JSON.stringify({}) + "\n");
+  assert.equal((await run(["enable", "opencode"], env)).code, 0);
+  mkdirSync(join(fx.home, ".local", "share", "opencode"), { recursive: true });
+  writeFileSync(join(fx.home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ "ollama-cloud": { type: "api" } }));
+  writeFileSync(join(fx.home, ".caveman", "caveman.yaml"), "compat:\n  ollama-cloud:\n    base_url: https://ollama.com/v1\n");
+
+  const warnings = async (baseURL) => {
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    delete config.model;
+    if (baseURL === undefined) delete config.provider["ollama-cloud"];
+    else config.provider["ollama-cloud"] = { options: { baseURL } };
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    return JSON.parse((await run(["doctor", "opencode"], env)).stdout).warnings.join("\n");
+  };
+
+  // No baseURL at all, and a baseURL aimed at the upstream: both go direct.
+  assert.match(await warnings(undefined), /"ollama-cloud" is not routed through Caveman/);
+  assert.match(await warnings("https://ollama.com/v1"), /"ollama-cloud" is not routed through Caveman/);
+  // Another process on the gateway's port is not the gateway's wedge.
+  assert.match(await warnings("http://127.0.0.1:8787/v1"), /"ollama-cloud" is not routed through Caveman/);
+
+  // Pointed at a compat mount that does not exist, the request reaches the
+  // proxy and 404s. Saying it "goes direct" names the wrong cause, so this
+  // case gets the mount it is missing instead.
+  const missingMount = await warnings("http://127.0.0.1:8787/w/opencode/compat/typo-cloud/v1");
+  assert.match(missingMount, /compat\.typo-cloud\.base_url/);
+  assert.doesNotMatch(missingMount, /goes? direct/);
+});
+
 test("status recognizes native OpenCode MCP recovery when the config rewrites key order", async () => {
   const fx = fixture();
   const configDir = join(fx.home, ".config", "opencode");

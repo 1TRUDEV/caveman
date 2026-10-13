@@ -3594,37 +3594,39 @@ function proxyYamlMode(): unknown {
 // already set, and never asserts when the upstream cannot be verified.
 const CLAUDE_ASSUME_FIRST_PARTY_ENV = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL";
 
-// yamlProviderBaseUrl scans an indentation-nested `providers.<name>.base_url`
-// key without a YAML dependency (the published CLI has zero runtime deps).
-// Returns the value when found, null when the providers/<name> block or key is
-// absent, and undefined when the document uses a shape the scan cannot follow
-// (flow-style `{...}` blocks) — callers must treat undefined as unverifiable.
-function yamlProviderBaseUrl(raw: string, provider: string): string | null | undefined {
+// yamlScopedBaseUrl scans an indentation-nested `<group>.<name>.base_url` key
+// without a YAML dependency (the published CLI has zero runtime deps). Returns
+// the value when found, null when the group/<name> block or key is absent, and
+// undefined when the document uses a shape the scan cannot follow (flow-style
+// `{...}` blocks) — callers must treat undefined as unverifiable. `providers`
+// answers which upstream the proxy forwards to; `compat` answers whether a
+// user-defined mount exists at all (#1254).
+function yamlScopedBaseUrl(raw: string, group: string, name: string): string | null | undefined {
   const lines = raw.split(/\r?\n/);
-  let providersIndent = -1;
-  let providerIndent = -1;
+  let groupIndent = -1;
+  let nameIndent = -1;
   for (const line of lines) {
     const code = line.split("#", 1)[0]!;
     if (!code.trim()) continue;
     const indent = code.length - code.trimStart().length;
     const keyMatch = code.trim().match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (providersIndent !== -1 && indent <= providersIndent) providersIndent = -1;
-    if (providerIndent !== -1 && indent <= providerIndent) providerIndent = -1;
+    if (groupIndent !== -1 && indent <= groupIndent) groupIndent = -1;
+    if (nameIndent !== -1 && indent <= nameIndent) nameIndent = -1;
     if (!keyMatch) continue;
     const key = keyMatch[1]!;
     const rest = keyMatch[2] ?? "";
     if (rest.startsWith("{") || rest.startsWith("[")) {
-      // Flow-style collections keep their children on this line; a providers
+      // Flow-style collections keep their children on this line; a group
       // subtree written that way is beyond this scan, so report unverifiable.
-      if (key === "providers" || providersIndent !== -1) return undefined;
+      if (key === group || groupIndent !== -1) return undefined;
       continue;
     }
-    if (providerIndent !== -1 && key === "base_url") {
+    if (nameIndent !== -1 && key === "base_url") {
       const value = rest.replace(/^["']|["']\s*$/g, "").trim();
       return value || null;
     }
-    if (providersIndent !== -1 && key === provider && providerIndent === -1) providerIndent = indent;
-    else if (key === "providers" && providersIndent === -1 && providerIndent === -1 && indent === 0) providersIndent = indent;
+    if (groupIndent !== -1 && key === name && nameIndent === -1) nameIndent = indent;
+    else if (key === group && groupIndent === -1 && nameIndent === -1 && indent === 0) groupIndent = indent;
   }
   return null;
 }
@@ -3642,7 +3644,7 @@ function proxyAnthropicUpstreamIsFirstParty(): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException)?.code === "ENOENT";
   }
-  const override = yamlProviderBaseUrl(raw, "anthropic");
+  const override = yamlScopedBaseUrl(raw, "providers", "anthropic");
   if (override === undefined) return false;
   if (override === null) return true;
   try {
@@ -8104,26 +8106,98 @@ function opencodeNativeRoutes(gw: string): Record<string, string> {
   };
 }
 
-// Only the journaled providers reach the proxy. Anything else (GitHub Copilot,
-// Zen) goes direct while the install reads healthy (#1190), so name it. Global
-// config only, the same file enable edits; a project opencode.json can still
-// pick another model.
-function opencodeUnroutedActiveProvider(routed: string[]): string | null {
+// proxyCompatMount answers whether the local proxy serves a user-defined
+// compat mount of this name: the value when caveman.yaml declares one, null
+// when it demonstrably does not, and undefined when the file cannot be read or
+// uses a shape the scan cannot follow.
+function proxyCompatMount(name: string): string | null | undefined {
+  const path = process.env.CAVEMAN_CONFIG ?? join(cavemanHome(), "caveman.yaml");
+  try {
+    return yamlScopedBaseUrl(readFileSync(path, "utf8"), "compat", name);
+  } catch {
+    return undefined;
+  }
+}
+
+// opencodeBaseUrlRouting reads a provider's configured endpoint and answers
+// where its requests actually go. #1190 asked the install journal, which holds
+// only the three routes `enable` writes, so a provider the user routed by hand
+// — baseURL pointed at the gateway's own /w/opencode wedge — was reported as
+// going direct and "not compressed or counted" while the proxy was recording
+// every one of its requests (#1254). The endpoint is the evidence; the name
+// never was.
+//
+// Origin plus the wedge prefix is the whole test, which covers the built-in
+// /openai/v1 and /anthropic/v1 paths and any deeper one without enumerating
+// them. A /compat/<name>/ path needs its mount to exist as well: without one
+// the request still reaches the proxy and 404s, which is a different problem
+// with a different remedy, so it is reported as the missing mount rather than
+// as going direct.
+function opencodeBaseUrlRouting(
+  baseUrl: unknown,
+  gw: string,
+): { routed: true } | { routed: false; mount: string } | null {
+  if (typeof baseUrl !== "string" || !baseUrl) return null;
+  let endpoint: URL;
+  let wedge: URL;
+  try {
+    endpoint = new URL(baseUrl);
+    wedge = new URL(appendUrlPath(gw, "/w/opencode"));
+  } catch {
+    return null;
+  }
+  if (endpoint.origin !== wedge.origin) return null;
+  const prefix = wedge.pathname.replace(/\/+$/, "");
+  const path = endpoint.pathname.replace(/\/+$/, "");
+  if (path !== prefix && !path.startsWith(`${prefix}/`)) return null;
+  const mount = path.slice(prefix.length).match(/^\/compat\/([^/]+)/);
+  if (!mount) return { routed: true };
+  const name = decodeURIComponent(mount[1]!);
+  // Only a readable config that demonstrably lacks the mount is evidence of
+  // one missing. Unverifiable must not bring the false alarm back in another
+  // spelling: the endpoint already proves these requests are not going direct.
+  return proxyCompatMount(name) === null ? { routed: false, mount: name } : { routed: true };
+}
+
+// Only the journaled providers reach the proxy by default. Anything else
+// (GitHub Copilot, Zen) goes direct while the install reads healthy (#1190), so
+// name it — unless the user routed it themselves (#1254). Global config only,
+// the same file enable edits; a project opencode.json can still pick another
+// model.
+function opencodeUnroutedActiveProvider(
+  routed: string[],
+  gw: string,
+): { provider: string; mount: string | null } | null {
+  const configs: Record<string, unknown>[] = [];
   for (const name of ["opencode.jsonc", "opencode.json"]) {
     try {
-      const model = (parseJsonc(readFileSync(join(homedir(), ".config", "opencode", name), "utf8")) as Record<string, unknown> | null)?.model;
-      if (typeof model === "string" && model.includes("/")) {
-        const provider = model.slice(0, model.indexOf("/"));
-        return routed.includes(provider) ? null : provider;
-      }
+      configs.push(objectValue(parseJsonc(readFileSync(join(homedir(), ".config", "opencode", name), "utf8"))));
     } catch { /* missing or unreadable: try the next source */ }
+  }
+  const verdict = (provider: string): { provider: string; mount: string | null } | null => {
+    if (routed.includes(provider)) return null;
+    // Every candidate config is consulted before answering, so a routed
+    // endpoint in one is never shadowed by a missing mount named in another.
+    let missing: string | null = null;
+    for (const config of configs) {
+      const routing = opencodeBaseUrlRouting(objectValue(objectValue(objectValue(config.provider)[provider]).options).baseURL, gw);
+      if (routing?.routed === true) return null;
+      if (routing?.routed === false) missing ??= routing.mount;
+    }
+    return { provider, mount: missing };
+  };
+  for (const config of configs) {
+    const model = config.model;
+    if (typeof model === "string" && model.includes("/")) return verdict(model.slice(0, model.indexOf("/")));
   }
   // No model pinned: OpenCode picks among signed-in providers, so only a
   // sign-in set with no routed provider at all is a sure miss.
   try {
     const dataRoot = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
     const signedIn = Object.keys(JSON.parse(readFileSync(join(dataRoot, "opencode", "auth.json"), "utf8")) ?? {});
-    return signedIn.length > 0 && !signedIn.some((id) => routed.includes(id)) ? signedIn[0]! : null;
+    if (signedIn.length === 0) return null;
+    const verdicts = signedIn.map((id) => verdict(id));
+    return verdicts.every((item) => item !== null) ? verdicts[0]! : null;
   } catch {
     return null;
   }
@@ -9679,8 +9753,15 @@ function nativeIntegrationStatus(agent: NativeAgent) {
   const warnings: string[] = [];
   if (agent === "opencode" && installed) {
     const routed = Object.keys((routeOperation?.owned?.routes as Record<string, unknown> | undefined) ?? {});
-    const unrouted = opencodeUnroutedActiveProvider(routed);
-    if (unrouted) warnings.push(`OpenCode's active provider "${unrouted}" is not routed through Caveman; its requests go direct and are not compressed or counted (routed: ${routed.join(", ")})`);
+    const unrouted = opencodeUnroutedActiveProvider(routed, gatewayURL());
+    if (unrouted?.mount) {
+      // Already pointed at the proxy, just at a mount the proxy does not
+      // serve: those requests reach Caveman and 404, so naming the mount is
+      // the remedy, not "it goes direct" (#1254).
+      warnings.push(`OpenCode's active provider "${unrouted.provider}" points at the Caveman compat mount "${unrouted.mount}", which the local proxy does not serve; add compat.${unrouted.mount}.base_url to caveman.yaml so those requests can be forwarded`);
+    } else if (unrouted) {
+      warnings.push(`OpenCode's active provider "${unrouted.provider}" is not routed through Caveman; its requests go direct and are not compressed or counted (routed: ${routed.join(", ")})`);
+    }
   }
   const fileText = checks.map((check) => fileBytes(check.file)?.toString("utf8") ?? "").join("\n");
   const components: NativeComponents = {
