@@ -13088,12 +13088,22 @@ async function syncLocalSavings(cfg: Config): Promise<SyncOutcome> {
   // node:sqlite is built into Node ≥22.13 — still zero runtime deps. Imported
   // lazily so only sync paths ever load it (or pay its experimental warning).
   let DatabaseSync: (typeof import("node:sqlite"))["DatabaseSync"];
+  // Node 22-23 print "ExperimentalWarning: SQLite is an experimental feature"
+  // on first load; drop that one line rather than show it on every sync.
+  const emitWarning = process.emitWarning;
+  process.emitWarning = ((warning: unknown, ...rest: unknown[]) => {
+    const type = typeof rest[0] === "string" ? rest[0] : (rest[0] as { type?: string } | undefined)?.type;
+    if (type === "ExperimentalWarning" && /SQLite/.test(String((warning as Error)?.message ?? warning))) return;
+    (emitWarning as (...args: unknown[]) => void).call(process, warning, ...rest);
+  }) as typeof process.emitWarning;
   try {
     ({ DatabaseSync } = await import("node:sqlite"));
   } catch {
     throw new Error(
       `caveman sync requires Node >= 22.13 (it reads the local spend store via node:sqlite); you are running Node ${process.versions.node}`,
     );
+  } finally {
+    process.emitWarning = emitWarning;
   }
   const db = new DatabaseSync(dbPath, { readOnly: true });
   let rows: Record<string, unknown>[];
@@ -13167,24 +13177,39 @@ async function syncLocalSavings(cfg: Config): Promise<SyncOutcome> {
       if (!Number.isFinite(ms)) return [];
       return directiveInstalls.filter((d) => ms >= d.installedAtMs).map((d) => d.id);
     };
-    const body = rows.map((r) => syncRequestSpan(r, rowDirectives(r))).join("\n") + "\n";
-    const response = await fetch(`${cfg.baseURL}/api/v1/imports?format=caveman-jsonl`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${cfg.token}`,
-        "content-type": "application/octet-stream",
-        "x-cave-csrf": "cli",
-      },
-      body,
-    });
-    const result = (await response.json().catch(() => ({}))) as { status?: string; error?: { message?: string } };
-    if (!response.ok || result.status !== "completed") {
-      throw new Error(result.error?.message ?? `sync import failed (${response.status})`);
-    }
-
     const num = (v: unknown) => (typeof v === "bigint" ? Number(v) : typeof v === "number" && Number.isFinite(v) ? v : 0);
-    const maxId = rows.reduce((m, r) => Math.max(m, num(r.id)), since);
-    writeSyncWatermark(key, maxId);
+    // The import endpoint caps a body at 16 MiB, and a long-unsynced store is
+    // larger than that. Upload in id order in batches under the cap, moving the
+    // watermark after each, so a failed batch keeps the ones before it.
+    const maxBytes = Number(process.env.CAVEMAN_SYNC_MAX_BATCH_BYTES) || 8 << 20;
+    for (let start = 0; start < rows.length;) {
+      let body = "";
+      let bytes = 0;
+      let end = start;
+      while (end < rows.length) {
+        const line = syncRequestSpan(rows[end]!, rowDirectives(rows[end]!)) + "\n";
+        const size = Buffer.byteLength(line);
+        if (body && bytes + size > maxBytes) break;
+        body += line;
+        bytes += size;
+        end++;
+      }
+      const response = await fetch(`${cfg.baseURL}/api/v1/imports?format=caveman-jsonl`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${cfg.token}`,
+          "content-type": "application/octet-stream",
+          "x-cave-csrf": "cli",
+        },
+        body,
+      });
+      const result = (await response.json().catch(() => ({}))) as { status?: string; error?: { message?: string } };
+      if (!response.ok || result.status !== "completed") {
+        throw new Error(result.error?.message ?? `sync import failed (${response.status})`);
+      }
+      writeSyncWatermark(key, num(rows[end - 1]!.id));
+      start = end;
+    }
     const tokensSaved = rows.reduce((sum, r) => sum + Math.max(0, num(r.compression_tokens_before) - num(r.compression_tokens_after)), 0);
     const tokenBases = new Set(rows.map((r) => (typeof r.compression_token_count_basis === "string" ? r.compression_token_count_basis : "")).filter(Boolean));
     const tokenCountBasis = tokenBases.size === 0 ? "unavailable" : tokenBases.size === 1 ? [...tokenBases][0] ?? "unavailable" : "mixed";
