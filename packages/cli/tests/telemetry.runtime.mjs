@@ -490,7 +490,7 @@ test("two CLI processes racing the same watermark do not both claim the delta", 
   const configDir = iso.caveDir;
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "cloud.json"), JSON.stringify({
-    telemetry: { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-08-01T00:00:00.000Z", promptVersion: 5 },
+    telemetry: { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-08-01T00:00:00.000Z", promptVersion: 6 },
     telemetryTokens: { tokensIn: 500, tokensSaved: 100, at: "2026-08-01T00:00:00.000Z" },
   }));
   const baseEnv = stubProxyStats(iso, { tokensIn: 1500, tokensSaved: 300 });
@@ -532,7 +532,7 @@ test("a stale lock from a crashed holder does not wedge telemetry off", async (t
   mkdirSync(configDir, { recursive: true });
   const configFile = join(configDir, "cloud.json");
   writeFileSync(configFile, JSON.stringify({
-    telemetry: { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-08-01T00:00:00.000Z", promptVersion: 5 },
+    telemetry: { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-08-01T00:00:00.000Z", promptVersion: 6 },
     telemetryTokens: { tokensIn: 500, tokensSaved: 100, at: "2026-08-01T00:00:00.000Z" },
   }));
   // A holder that died without releasing, aged well past the stale window.
@@ -580,6 +580,7 @@ test("telemetry off drops the token watermark so re-enabling re-seeds", async (t
   assert.equal(offOut.anonymous_id, "none");
   assert.equal(offOut.discarded_anonymous_id, "123e4567-e89b-12d3-a456-426614174000");
   assert.match(offOut.delete_sent_data, /SECURITY\.md#delete-sent-telemetry$/);
+  assert.match(offOut.note, /caveman-blocks telemetry is off too/, "one opt-out covers Blocks, and says so");
   const again = JSON.parse((await runCli(["telemetry", "off"], iso.env)).stdout);
   assert.equal("discarded_anonymous_id" in again, false, "an id already discarded is not reprinted");
   const afterOff = JSON.parse(readFileSync(join(configDir, "cloud.json"), "utf8"));
@@ -716,7 +717,7 @@ test("a stale-version opt-in is re-disclosed once and never re-asked", async (t)
     enabled: true,
     anonymousId: "123e4567-e89b-12d3-a456-426614174000",
     decidedAt: "2026-07-03T00:00:00.000Z",
-    promptVersion: 4,
+    promptVersion: 5,
   };
   writeFileSync(join(configDir, "cloud.json"), JSON.stringify({ telemetry: optIn }));
 
@@ -727,9 +728,10 @@ test("a stale-version opt-in is re-disclosed once and never re-asked", async (t)
     return;
   }
   assert.match(first.output, /IP address/, "the widened scope must be disclosed");
+  assert.match(first.output, /caveman-blocks commands and usage counts/, "v6 names the Blocks counts it now covers");
   assert.doesNotMatch(first.output, /\[y\/N\]/, "an existing decision is never re-asked");
   const cfg = JSON.parse(readFileSync(join(configDir, "cloud.json"), "utf8"));
-  assert.equal(cfg.telemetry.promptVersion, 5);
+  assert.equal(cfg.telemetry.promptVersion, 6);
   assert.equal(cfg.telemetry.anonymousId, optIn.anonymousId, "re-disclosure must not rotate the id");
   assert.equal(cfg.telemetry.decidedAt, optIn.decidedAt, "the original decision date stands");
 
@@ -805,7 +807,7 @@ test("a native session start sends session_start in the background for a persist
   const port = await listenOrSkip(t, stub);
   if (port === null) return;
   const anonymousId = "123e4567-e89b-12d3-a456-426614174000";
-  const env = nativeSessionEnv(port, { enabled: true, anonymousId, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 5 });
+  const env = nativeSessionEnv(port, { enabled: true, anonymousId, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 6 });
 
   await runNativeSessionStart(env, { source: "startup" });
   // A repeat for the same host session (resume, re-asking plugin) is not a new session.
@@ -831,12 +833,12 @@ test("a native session start sends nothing without a current persisted yes, or o
   const port = await listenOrSkip(t, stub);
   if (port === null) return;
   const anonymousId = "123e4567-e89b-12d3-a456-426614174000";
-  const yes = { enabled: true, anonymousId, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 5 };
+  const yes = { enabled: true, anonymousId, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 6 };
   const cases = [
     [undefined, { source: "startup" }, {}],
-    [{ enabled: false, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 5 }, { source: "startup" }, {}],
+    [{ enabled: false, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 6 }, { source: "startup" }, {}],
     [{ ...yes, promptVersion: 4 }, { source: "startup" }, {}],
-    [{ enabled: true, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 5 }, { source: "startup" }, {}],
+    [{ enabled: true, decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 6 }, { source: "startup" }, {}],
     [yes, { source: "compact" }, {}],
     [yes, { source: "startup" }, { DO_NOT_TRACK: "1" }],
     [yes, { source: "startup" }, { CAVEMAN_TELEMETRY: "0" }],
@@ -857,7 +859,7 @@ test("a native hook never holds the host on a telemetry POST, even with CAVEMAN_
   const stub = startTelemetryStub({ hang: true });
   const port = await listenOrSkip(t, stub);
   if (port === null) return;
-  const env = nativeSessionEnv(port, { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 5 }, { CAVEMAN_TELEMETRY: "1" });
+  const env = nativeSessionEnv(port, { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-09-24T00:00:00.000Z", promptVersion: 6 }, { CAVEMAN_TELEMETRY: "1" });
 
   const { closedMs } = await runNativeSessionStart(env, { source: "startup", session_id: "env-on" });
   assert.ok(closedMs < 1200, `hook held the host for ${closedMs}ms`);
@@ -875,7 +877,7 @@ test("an interactive run under DO_NOT_TRACK persists the opt-out", async (t) => 
   const configDir = caveDir;
   mkdirSync(configDir, { recursive: true });
   writeFileSync(join(configDir, "cloud.json"), JSON.stringify({
-    telemetry: { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-07-03T00:00:00.000Z", promptVersion: 5 },
+    telemetry: { enabled: true, anonymousId: "123e4567-e89b-12d3-a456-426614174000", decidedAt: "2026-07-03T00:00:00.000Z", promptVersion: 6 },
     telemetryTokens: { tokensIn: 10, tokensSaved: 1, at: "2026-07-03T00:00:00.000Z" },
   }));
 
