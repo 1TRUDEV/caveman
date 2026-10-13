@@ -28,6 +28,8 @@ class HookScriptTests(unittest.TestCase):
     def run_cmd(self, cmd, home, extra_env=None):
         env = os.environ.copy()
         env.pop("CLAUDE_PLUGIN_ROOT", None)
+        # An exported CLAUDE_CONFIG_DIR would aim install/uninstall at the real config.
+        env.pop("CLAUDE_CONFIG_DIR", None)
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)
         if extra_env:
