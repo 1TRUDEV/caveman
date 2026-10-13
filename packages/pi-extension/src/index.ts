@@ -25,13 +25,28 @@ function cavemanHome(): string {
   return process.env.CAVEMAN_HOME || join(homedir(), ".caveman");
 }
 
+// The CLI's config is $CAVEMAN_HOME/cloud.json; the pre-v4
+// ~/.caveman-cloud/config.json counts only while the new file does not exist.
+// Its gatewayUrl is the traffic target only when chosen at login
+// (managedGateway); signing in alone keeps the local proxy, on the port setup
+// moved it to (localPort) when another program held 8787.
 function gatewayUrl(): string {
   const env = process.env.CAVE_GATEWAY_URL?.trim();
   if (env) return env;
-  try {
-    const config = JSON.parse(readFileSync(join(homedir(), ".caveman-cloud", "config.json"), "utf8"));
-    if (typeof config.gatewayUrl === "string" && config.gatewayUrl) return config.gatewayUrl;
-  } catch { /* no config — default below */ }
+  for (const path of [join(cavemanHome(), "cloud.json"), join(homedir(), ".caveman-cloud", "config.json")]) {
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    try {
+      const config = JSON.parse(raw);
+      if (config.managedGateway === true && typeof config.gatewayUrl === "string" && config.gatewayUrl) return config.gatewayUrl;
+      if (Number.isInteger(config.localPort) && config.localPort >= 1024 && config.localPort <= 65535) return `http://127.0.0.1:${config.localPort}`;
+    } catch { /* unreadable config — default below */ }
+    break;
+  }
   return "http://127.0.0.1:8787";
 }
 

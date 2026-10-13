@@ -79,9 +79,10 @@ Every reply runs a check before it sends: opener that announces the plan, delete
 ## Install
 
 ```bash
-npm install -g @caveman-ai/cli && caveman setup --install
-caveman claude        # or codex · gemini · aider · kilo · qwen · opencode · hermes · openclaw · pi
+npx @caveman-ai/cli
 ```
+
+One command, same on Mac, Linux and Windows. Caveman look at your machine, find your agents and your logins, show what it change. Press Enter. It set up, then offer to start Claude Code. Later, `caveman claude` (or codex · gemini · aider · kilo · qwen · opencode · hermes · openclaw · pi).
 
 **This is the proxy, the big rock.** Your agent reads 33.2% fewer input tokens across whole sessions, same answers. It runs on your machine, with your keys and your Claude Pro/Max login. Needs Node.js 22.13+. After the first run, plain `claude` stays caveman'd. One rock. That it.
 
@@ -194,7 +195,7 @@ claude plugin marketplace add JuliusBrussee/caveman && claude plugin install cav
 gemini extensions install https://github.com/JuliusBrussee/caveman
 
 # Every agent on your machine at once, plus the Claude Code statusline badge (Node.js 22.13+)
-curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/v3.2.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.0.0/install.sh | bash
 ```
 
 Already inside Claude Code? Same rock, slash form. Type these where you talk to Claude:
@@ -207,13 +208,15 @@ Already inside Claude Code? Same rock, slash form. Type these where you talk to 
 Windows, PowerShell 5.1+:
 
 ```powershell
-irm https://raw.githubusercontent.com/JuliusBrussee/caveman/v3.2.0/install.ps1 | iex
+irm https://raw.githubusercontent.com/JuliusBrussee/caveman/v4.0.0/install.ps1 | iex
 ```
 
 On npm 12 or newer, new npm block git install. One-liners above handle it themselves from v3.2.0 on. Old one-liner pinned to v3.1.0 or older still fail there: use one above, or this:
-`npx --allow-git=root -y github:JuliusBrussee/caveman#v3.2.0`
+`npx --allow-git=root -y github:JuliusBrussee/caveman#v4.0.0`
 
 Changed your mind: `npx -y github:JuliusBrussee/caveman -- --uninstall` (on npm 12+, add `--allow-git=root` too)
+
+Only grabbed the skill? `npx skills remove JuliusBrussee/caveman -g` take it back out.
 
 Install broke? Open your agent in this repo and say *"Read CLAUDE.md and INSTALL.md, install caveman for me."* Agent fix own brain.
 
@@ -257,7 +260,7 @@ Started as a joke in April 2026. Now past 100,000 stars. Joke got serious. Voice
 
 ## Privacy
 
-The skill runs on your machine and sends nothing. The `caveman` CLI sends usage stats by default: commands run, token counts, a random install ID, OS, and IP. Never your prompts, code, or file paths. One person maintains this for free, and those stats show what to build next. Turn it off for good with `caveman telemetry off` or `DO_NOT_TRACK=1`. The full list, and how to delete what was sent: [SECURITY.md](./SECURITY.md).
+The skill runs on your machine and sends nothing. The `caveman` CLI sends usage stats by default: commands run, token counts, caveman-blocks commands and usage counts, a random install ID, OS, and IP. Never your prompts, code, file paths, or scripts you wrote. One person maintains this for free, and those stats show what to build next. Turn it off for good, Blocks included, with `caveman telemetry off` or `DO_NOT_TRACK=1`. Routing, once you sign in, adds Auto to your agent's model picker; pick Auto and each ask sends your latest ask (with whatever your agent attaches to it, such as CLAUDE.md, memory or @-mentioned files), the one before it and the end of the agent's last reply to Caveman Cloud to pick the model and effort, with each request's tool names, effort, a few agent headers and the previous request's token counts; on the Free plan Caveman may keep it to improve routing. Requests go from your machine to your provider, or to another provider you added with `caveman providers add`, on your own key; only a request routed to a Caveman Cloud model passes through Caveman Cloud, whole (system prompt, tool results, code), running on your Caveman project's stored key and billed to that project; `caveman providers cloud off` stops that. `caveman off routing` stops it. The full list, and how to delete sent telemetry: [SECURITY.md](./SECURITY.md).
 
 ## License
 
