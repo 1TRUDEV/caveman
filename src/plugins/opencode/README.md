@@ -18,7 +18,7 @@ calls both entrypoints (some V1 builds do) still uses only `server()`.
 | `package.json` | Marks the directory as ESM so the loader reads `plugin.js` correctly. |
 | `commands/*.md` | Slash-command prompt templates (`/caveman`, `/ultracave`, `/megacave`, `/caveman-commit`, …). |
 
-The installer (`bin/install.js --only opencode`) copies these alongside
+The installer (`installer/install.js --only opencode`) copies these alongside
 `src/hooks/caveman-config.js` (for the symlink-safe flag-write helpers, renamed
 to `caveman-config.cjs` because this directory is `"type": "module"`) into
 `~/.config/opencode/plugins/caveman/`. It also writes a **flat shim**

@@ -16,9 +16,9 @@ import { createRequire } from 'node:module';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
-const INSTALLER = path.join(REPO_ROOT, 'bin', 'install.js');
+const INSTALLER = path.join(REPO_ROOT, 'installer', 'install.js');
 const requireCjs = createRequire(import.meta.url);
-const SETTINGS = requireCjs(path.join(REPO_ROOT, 'bin', 'lib', 'settings.js'));
+const SETTINGS = requireCjs(path.join(REPO_ROOT, 'installer', 'lib', 'settings.js'));
 const MODE_LOG_BASENAME = '.caveman-mode-log.jsonl';
 
 const IS_WIN = process.platform === 'win32';
@@ -28,7 +28,9 @@ function freshTmpDir() {
 }
 
 // Make a throwaway `opencode` binary on PATH so detectMatch('command:opencode')
-// returns true. The shim never executes — installer only checks PATH presence.
+// returns true. The shim also runs for the `opencode --version` probe, but
+// prints nothing, so opencodeMajorVersion() returns null and the install uses
+// the V1 config path.
 function shimOpencode() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-shim-'));
   if (IS_WIN) {
@@ -96,6 +98,8 @@ test('opencode fresh install drops plugin, commands, agents, skills, AGENTS.md, 
     }
     for (const f of ['cavecrew-investigator.md', 'cavecrew-builder.md', 'cavecrew-reviewer.md']) {
       assert.ok(fs.existsSync(path.join(ocDir, 'agents', f)), `agent ${f} missing`);
+      // Subagent-only: keeps cavecrew out of opencode's Tab cycle (#725).
+      assert.match(fs.readFileSync(path.join(ocDir, 'agents', f), 'utf8'), /^mode: subagent$/m, `agent ${f} must be mode: subagent`);
     }
     for (const name of ['caveman', 'ultracave', 'megacave', 'caveman-commit', 'caveman-review', 'caveman-help', 'caveman-stats', 'caveman-compress', 'cavecrew']) {
       assert.ok(fs.existsSync(path.join(ocDir, 'skills', name, 'SKILL.md')), `skill ${name}/SKILL.md missing`);
@@ -731,6 +735,7 @@ test('opencode V2 setup() parses raw prompts, injects SystemPart reinforcement, 
   const xdg = freshTmpDir();
   const shimDir = shimOpencode();
   const origDefault = process.env.CAVEMAN_DEFAULT_MODE;
+  const origXdg = process.env.XDG_CONFIG_HOME;
   try {
     const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
     assert.notEqual(runInstaller(['--only', 'opencode'], env).status, 2);
@@ -820,6 +825,80 @@ test('opencode V2 setup() parses raw prompts, injects SystemPart reinforcement, 
   } finally {
     if (origDefault === undefined) delete process.env.CAVEMAN_DEFAULT_MODE;
     else process.env.CAVEMAN_DEFAULT_MODE = origDefault;
+    if (origXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = origXdg;
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
+// ── V2 one-shot restore parity with the V1 chat.message path (#599) ─────────
+// The V2 prompt hook must mirror the V1 one-shot bookkeeping: a chained
+// /caveman-commit then /caveman-review restores the ORIGINAL prose mode, a
+// one-shot from off returns to off, and a status probe consumes no restore.
+test('opencode V2 setup() restores the displaced prose mode after a one-shot, matching V1', async () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencode();
+  const origDefault = process.env.CAVEMAN_DEFAULT_MODE;
+  const origXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    assert.notEqual(runInstaller(['--only', 'opencode'], env).status, 2);
+
+    const pluginPath = path.join(xdg, 'opencode', 'plugins', 'caveman', 'plugin.js');
+    const flagPath = path.join(xdg, 'opencode', '.caveman-active');
+    const prevPath = path.join(xdg, 'opencode', '.caveman-active.prev');
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
+
+    const mod = await import(pathToFileURL(pluginPath).href + '?v2-oneshot');
+    const hooks = {};
+    const ctx = { session: { hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; } } };
+    await mod.default.setup(ctx);
+
+    const send = (text) => hooks.prompt({ prompt: { text } });
+    const flag = () => (fs.existsSync(flagPath) ? fs.readFileSync(flagPath, 'utf8') : null);
+
+    // A one-shot displaces ultracave and remembers it.
+    send('/ultracave');
+    assert.equal(flag(), 'ultracave');
+    send('/caveman-commit');
+    assert.equal(flag(), 'commit', 'one-shot must take effect for its own turn');
+    assert.equal(fs.readFileSync(prevPath, 'utf8'), 'ultracave', 'displaced prose mode remembered');
+
+    // The next ordinary prompt restores it.
+    send('now fix the parser bug');
+    assert.equal(flag(), 'ultracave', 'next ordinary prompt must restore the displaced prose mode');
+    assert.equal(fs.existsSync(prevPath), false, 'prev cleared once consumed');
+
+    // Chained one-shots keep the first return target.
+    send('/caveman-commit');
+    send('/caveman-review');
+    assert.equal(flag(), 'review');
+    assert.equal(fs.readFileSync(prevPath, 'utf8'), 'ultracave', 'chained one-shots keep the original target');
+    send('ship it');
+    assert.equal(flag(), 'ultracave', 'chained one-shots restore the original prose mode');
+
+    // A one-shot entered from off must return to off, never a stale target.
+    send('stop caveman');
+    assert.equal(flag(), null);
+    send('/caveman-compress');
+    assert.equal(flag(), 'compress');
+    send('summarize that');
+    assert.equal(flag(), null, 'a one-shot entered from off must return to off');
+
+    // A status probe is observational: it must not consume a pending restore.
+    send('/ultracave');
+    send('/caveman-commit');
+    send('/caveman status');
+    assert.equal(flag(), 'commit', 'status must not consume the pending one-shot');
+    send('fix it');
+    assert.equal(flag(), 'ultracave', 'restore still fires on the next real turn');
+  } finally {
+    if (origDefault === undefined) delete process.env.CAVEMAN_DEFAULT_MODE;
+    else process.env.CAVEMAN_DEFAULT_MODE = origDefault;
+    if (origXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = origXdg;
     fs.rmSync(xdg, { recursive: true, force: true });
     fs.rmSync(shimDir, { recursive: true, force: true });
   }
@@ -849,6 +928,173 @@ test('opencode V2 install omits the V1 plugin entry and prunes only its own lega
     assert.ok(fs.existsSync(path.join(ocDir, 'plugins', 'caveman.js')), 'flat shim not installed');
     assert.ok(fs.existsSync(path.join(ocDir, 'plugins', 'caveman', 'plugin.js')), 'payload not installed');
   } finally {
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
+// ── 9. One-shot independent modes restore the displaced prose mode ──────────
+// #599 parity. On Claude Code, caveman-mode-tracker.js remembers the prose mode
+// a one-shot (/caveman-commit, /caveman-review, /caveman-compress) displaces and
+// restores it on the next ordinary prompt. The opencode plugin wrote the
+// one-shot mode and never came back: `experimental.chat.system.transform` skips
+// INDEPENDENT_MODES, so a single /caveman-commit silently killed per-turn
+// reinforcement for the rest of the session — it only self-healed at the next
+// session.created. Same shared helpers (writeSessionPrev/readSessionPrev/
+// clearSessionPrev), same restore rule, so the two hosts cannot drift again.
+test('opencode plugin restores the displaced prose mode after a one-shot mode', async () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencode();
+  const origDefault = process.env.CAVEMAN_DEFAULT_MODE;
+  const origXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    const r = runInstaller(['--only', 'opencode'], env);
+    assert.notEqual(r.status, 2, `argv error: ${r.stderr}`);
+
+    const pluginPath = path.join(xdg, 'opencode', 'plugins', 'caveman', 'plugin.js');
+    const flagPath = path.join(xdg, 'opencode', '.caveman-active');
+    const prevPath = path.join(xdg, 'opencode', '.caveman-active.prev');
+
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
+
+    const mod = await import(pathToFileURL(pluginPath).href);
+    const handlers = await mod.default.server({});
+
+    const send = (text) => handlers['chat.message']({}, { parts: [{ type: 'text', text }] });
+    const reinforced = async () => {
+      const out = { system: ['base'] };
+      await handlers['experimental.chat.system.transform']({}, out);
+      return /CAVEMAN MODE ACTIVE/.test(out.system[0]);
+    };
+    const flag = () => (fs.existsSync(flagPath) ? fs.readFileSync(flagPath, 'utf8') : null);
+
+    // A one-shot displaces ultracave and remembers it.
+    await send('/ultracave');
+    assert.equal(flag(), 'ultracave');
+    await send('/caveman-commit');
+    assert.equal(flag(), 'commit', 'one-shot must take effect for its own turn');
+    assert.equal(await reinforced(), false, 'independent modes carry their own skill, not caveman reinforcement');
+    assert.equal(fs.readFileSync(prevPath, 'utf8'), 'ultracave', 'displaced prose mode must be remembered');
+
+    // The next ordinary prompt restores it — this is what regressed.
+    await send('now fix the parser bug');
+    assert.equal(flag(), 'ultracave', 'next ordinary prompt must restore the displaced prose mode');
+    assert.equal(await reinforced(), true, 'reinforcement must resume after the one-shot');
+    assert.equal(fs.existsSync(prevPath), false, 'prev must be cleared once consumed');
+
+    // A second one-shot chained onto the first must still restore the ORIGINAL
+    // prose mode, not the intervening one-shot.
+    await send('/caveman-commit');
+    await send('/caveman-review');
+    assert.equal(flag(), 'review');
+    assert.equal(fs.readFileSync(prevPath, 'utf8'), 'ultracave', 'chained one-shots keep the first return target');
+    await send('ship it');
+    assert.equal(flag(), 'ultracave', 'chained one-shots restore the original prose mode');
+
+    // A one-shot entered while caveman is OFF must restore off, never a stale
+    // return target left behind by an earlier one-shot.
+    await send('stop caveman');
+    assert.equal(flag(), null);
+    await send('/caveman-compress');
+    assert.equal(flag(), 'compress');
+    await send('summarize that');
+    assert.equal(flag(), null, 'a one-shot entered from off must return to off');
+    assert.equal(await reinforced(), false);
+  } finally {
+    if (origDefault === undefined) delete process.env.CAVEMAN_DEFAULT_MODE;
+    else process.env.CAVEMAN_DEFAULT_MODE = origDefault;
+    if (origXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = origXdg;
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
+// ── 10. Uninstall removes the opencode mode state, both files ──────────────
+// The Claude-side cleanup sweeps a `stateFiles` list that already names
+// `.caveman-active.prev`; the opencode branch only unlinked `.caveman-active`,
+// which was correct while the plugin never wrote a prev file. It writes one now
+// (one-shot restore, test 9), so uninstall has to take both or it leaves state
+// behind — and a stale prev is not inert: a reinstall's first one-shot would
+// read it as that session's return target.
+test('opencode uninstall removes both the mode flag and the one-shot prev file', () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencode();
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    const installed = runInstaller(['--only', 'opencode'], env);
+    assert.equal(installed.status, 0, installed.stderr);
+
+    const ocDir = path.join(xdg, 'opencode');
+    const flag = path.join(ocDir, '.caveman-active');
+    const prev = path.join(ocDir, '.caveman-active.prev');
+    fs.writeFileSync(flag, 'commit');
+    fs.writeFileSync(prev, 'ultracave');
+
+    const removed = runInstaller(['--uninstall'], env);
+    assert.equal(removed.status, 0, removed.stderr);
+    assert.equal(fs.existsSync(flag), false, 'mode flag must be removed');
+    assert.equal(fs.existsSync(prev), false, 'one-shot prev file must be removed');
+  } finally {
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
+// ── 11. An older caveman-config.cjs copy must not turn caveman OFF ─────────
+// The installed plugin loads a COPY of caveman-config (#848 plugin-cache
+// drift), which can predate writeSessionPrev/readSessionPrev/clearSessionPrev.
+// With no-op stubs the restore path reads a null return target and falls to its
+// deactivate branch, so a single /caveman-commit deleted the flag on the next
+// prompt — strictly worse than both the old behavior (one-shot sticks until the
+// next session) and the new one. Degrade to the old behavior instead.
+test('opencode plugin does not deactivate caveman when the config copy predates the prev helpers', async () => {
+  const xdg = freshTmpDir();
+  const shimDir = shimOpencode();
+  const origDefault = process.env.CAVEMAN_DEFAULT_MODE;
+  const origXdg = process.env.XDG_CONFIG_HOME;
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: xdg, PATH: pathWith(shimDir), NO_COLOR: '1' };
+    const r = runInstaller(['--only', 'opencode'], env);
+    assert.notEqual(r.status, 2, `argv error: ${r.stderr}`);
+
+    const pluginDir = path.join(xdg, 'opencode', 'plugins', 'caveman');
+    const configCjs = path.join(pluginDir, 'caveman-config.cjs');
+    // Simulate the older copy: everything else intact, the three prev exports
+    // absent — exactly what a pre-#599 caveman-config.cjs looks like.
+    fs.appendFileSync(configCjs,
+      '\ndelete module.exports.writeSessionPrev;'
+      + '\ndelete module.exports.readSessionPrev;'
+      + '\ndelete module.exports.clearSessionPrev;\n');
+
+    const flagPath = path.join(xdg, 'opencode', '.caveman-active');
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.CAVEMAN_DEFAULT_MODE = 'caveman';
+
+    // Cache-bust: earlier tests in this file already imported plugin.js.
+    const mod = await import(`${pathToFileURL(path.join(pluginDir, 'plugin.js')).href}?legacy-config`);
+    const handlers = await mod.default.server({});
+    const send = (text) => handlers['chat.message']({}, { parts: [{ type: 'text', text }] });
+    const flag = () => (fs.existsSync(flagPath) ? fs.readFileSync(flagPath, 'utf8') : null);
+
+    await send('/ultracave');
+    assert.equal(flag(), 'ultracave');
+    await send('/caveman-commit');
+    assert.equal(flag(), 'commit');
+
+    // The regression: this deleted the flag. Without the prev helpers the
+    // one-shot simply sticks, which is what this plugin did before #599 landed
+    // here — never a silent deactivation.
+    await send('now fix the parser bug');
+    assert.notEqual(flag(), null, 'a one-shot must never deactivate caveman on an older config copy');
+    assert.equal(flag(), 'commit', 'without prev helpers the one-shot sticks, as it did before');
+  } finally {
+    if (origDefault === undefined) delete process.env.CAVEMAN_DEFAULT_MODE;
+    else process.env.CAVEMAN_DEFAULT_MODE = origDefault;
+    if (origXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = origXdg;
     fs.rmSync(xdg, { recursive: true, force: true });
     fs.rmSync(shimDir, { recursive: true, force: true });
   }

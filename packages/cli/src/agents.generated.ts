@@ -111,10 +111,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "2.1.285",
+    "tested_agent_version": "2.1.291",
     "injection_completeness": "builder-assisted",
-    "last_verified_at": "2026-09-30",
-    "verified_by": "local pinned-binary probe (claude 2.1.285, agents/probe-installed.mjs)",
+    "last_verified_at": "2026-10-06",
+    "verified_by": "local pinned-binary probe (claude 2.1.291 on Node 22.22.2, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -148,10 +148,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "0.158.0",
+    "tested_agent_version": "0.160.1",
     "injection_completeness": "code-only",
-    "last_verified_at": "2026-09-29",
-    "verified_by": "local pinned-binary probe (codex 0.158.0, agents/probe-installed.mjs)",
+    "last_verified_at": "2026-10-06",
+    "verified_by": "local pinned-binary probe (codex 0.160.1 on Node 24.16.0, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -180,10 +180,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "0.61.0",
+    "tested_agent_version": "0.62.0",
     "injection_completeness": "declarative",
-    "last_verified_at": "2026-09-24",
-    "verified_by": "local pinned-binary probe (gemini 0.61.0, agents/probe-installed.mjs)",
+    "last_verified_at": "2026-10-03",
+    "verified_by": "local pinned-binary probe (gemini 0.62.0 on Node 24.16.0, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -215,8 +215,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "0.19.1",
+    "tested_agent_version": "0.21.5",
     "injection_completeness": "builder-assisted",
+    "last_verified_at": "2026-10-06",
+    "verified_by": "local pinned-binary probe (hermes 0.21.5 = release v2026.9.24 at f97608f1, editable install on Python 3.12, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -231,7 +233,7 @@ export const PROFILES: AgentProfile[] = [
       "kilocode"
     ],
     "args": [],
-    "install": "npm install -g @kilocode/cli@7.8.1",
+    "install": "npm install -g @kilocode/cli@7.8.3",
     "wire_protocol": "openai-chat",
     "injection": {
       "method": "config-env-content",
@@ -317,10 +319,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "X-Cave-Agent"
     },
-    "tested_agent_version": "7.8.1",
+    "tested_agent_version": "7.8.3",
     "injection_completeness": "declarative",
-    "last_verified_at": "2026-09-26",
-    "verified_by": "local pinned-binary probe (kilo 7.8.1, agents/probe-installed.mjs)",
+    "last_verified_at": "2026-10-03",
+    "verified_by": "local pinned-binary probe (kilo 7.8.3 on Node 24.16.0, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -378,10 +380,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "2026.9.5",
+    "tested_agent_version": "2026.9.8",
     "injection_completeness": "builder-assisted",
-    "last_verified_at": "2026-09-21",
-    "verified_by": "local pinned-binary probe (openclaw 2026.9.5 on Node 24.16.0, agents/probe-installed.mjs)",
+    "last_verified_at": "2026-10-03",
+    "verified_by": "local pinned-binary probe (openclaw 2026.9.8 on Node 24.16.0, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -415,6 +417,14 @@ export const PROFILES: AgentProfile[] = [
             "anthropic": {
               "options": {
                 "baseURL": "{{cave_base_url}}/v1",
+                "headers": {
+                  "X-Cave-Agent": "opencode"
+                }
+              }
+            },
+            "opencode-go": {
+              "options": {
+                "baseURL": "{{cave_base_url}}/compat/opencode-go/v1",
                 "headers": {
                   "X-Cave-Agent": "opencode"
                 }
@@ -464,10 +474,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "X-Cave-Agent"
     },
-    "tested_agent_version": "1.18.33",
+    "tested_agent_version": "1.18.34",
     "injection_completeness": "declarative",
-    "last_verified_at": "2026-09-28",
-    "verified_by": "local pinned-binary probe (opencode 1.18.33, agents/probe-installed.mjs)",
+    "last_verified_at": "2026-10-03",
+    "verified_by": "local pinned-binary probe (opencode 1.18.34 on Node 24.16.0, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -492,10 +502,10 @@ export const PROFILES: AgentProfile[] = [
     "command_hook": {
       "method": "pi-extension"
     },
-    "tested_agent_version": "1.0.0",
+    "tested_agent_version": "1.0.4",
     "injection_completeness": "builder-assisted",
-    "last_verified_at": "2026-10-02",
-    "verified_by": "local pinned-binary probe (pi 1.0.0, agents/probe-installed.mjs); packages/pi-extension suite against pi-coding-agent 1.0.0",
+    "last_verified_at": "2026-10-06",
+    "verified_by": "local pinned-binary probe (pi 1.0.4, agents/probe-installed.mjs); packages/pi-extension suite against pi-coding-agent 1.0.4",
     "fallback": "none",
     "maintainer": null
   },
@@ -511,7 +521,7 @@ export const PROFILES: AgentProfile[] = [
     "args": [
       "--extensions=none"
     ],
-    "install": "npm i -g @qwen-code/qwen-code@0.24.6",
+    "install": "npm i -g @qwen-code/qwen-code@0.25.0",
     "wire_protocol": "openai-chat",
     "injection": {
       "method": "config-file",
@@ -757,10 +767,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "X-Cave-Agent"
     },
-    "tested_agent_version": "0.24.6",
+    "tested_agent_version": "0.25.0",
     "injection_completeness": "declarative",
-    "last_verified_at": "2026-09-26",
-    "verified_by": "local pinned-binary route probe (@qwen-code/qwen-code 0.24.6)",
+    "last_verified_at": "2026-10-06",
+    "verified_by": "local pinned-binary probe (@qwen-code/qwen-code 0.25.0 on Node 24.16.0, agents/probe-installed.mjs) plus route check: the real binary, launched with the CLI buildWrapEnv overlay, sent POST /w/qwen/v1/chat/completions (X-Cave-Agent: qwen, model gpt-5.5) to a loopback recorder",
     "fallback": "generic-env",
     "maintainer": null
   }
