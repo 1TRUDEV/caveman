@@ -111,10 +111,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "2.1.299",
+    "tested_agent_version": "2.1.296",
     "injection_completeness": "builder-assisted",
-    "last_verified_at": "2026-10-14",
-    "verified_by": "local pinned-binary probe (claude 2.1.299 on Node 22.22.0, agents/probe-installed.mjs); route probe: ANTHROPIC_BASE_URL redirection observed reaching POST /v1/messages?beta=true",
+    "last_verified_at": "2026-10-10",
+    "verified_by": "local pinned-binary probe (claude 2.1.296 on Node 22.22.0, agents/probe-installed.mjs); route probe: ANTHROPIC_BASE_URL redirection observed reaching POST /v1/messages?beta=true",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -180,10 +180,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "0.64.0",
+    "tested_agent_version": "0.63.0",
     "injection_completeness": "declarative",
-    "last_verified_at": "2026-10-14",
-    "verified_by": "local pinned-binary probe (gemini 0.64.0 on Node 22.22.0, agents/probe-installed.mjs); route probe: GOOGLE_GEMINI_BASE_URL redirection observed reaching POST /v1beta/models/{model}:generateContent",
+    "last_verified_at": "2026-10-07",
+    "verified_by": "local pinned-binary probe (gemini 0.63.0 on Node 22.22.0, agents/probe-installed.mjs); route probe: GOOGLE_GEMINI_BASE_URL redirection observed reaching POST /v1beta/models/{model}:streamGenerateContent",
     "fallback": "generic-env",
     "maintainer": null
   },
@@ -380,10 +380,10 @@ export const PROFILES: AgentProfile[] = [
     "attribution": {
       "header": "x-cave-agent"
     },
-    "tested_agent_version": "2026.10.3",
+    "tested_agent_version": "2026.9.8",
     "injection_completeness": "builder-assisted",
-    "last_verified_at": "2026-10-14",
-    "verified_by": "local pinned-binary probe (openclaw 2026.10.3 on Node 24.16.0, agents/probe-installed.mjs); SOUL.md/workspace-skill bootstrap surface not re-observed against a live session",
+    "last_verified_at": "2026-10-03",
+    "verified_by": "local pinned-binary probe (openclaw 2026.9.8 on Node 24.16.0, agents/probe-installed.mjs)",
     "fallback": "generic-env",
     "maintainer": null
   },
