@@ -75,7 +75,7 @@ jobs:
           - id: kilo
             install: npm install -g @kilocode/cli@7.8.8
           - id: openclaw
-            install: npm install -g openclaw@2026.9.8
+            install: npm install -g openclaw@2026.10.3
           - id: opencode
             install: npm install -g opencode-ai@1.19.0
           - id: pi
