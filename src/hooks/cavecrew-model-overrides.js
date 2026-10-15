@@ -130,6 +130,9 @@ function applyOverrides(pluginRoot, env) {
     const patched = patchFrontmatterModel(content, modelValue);
     if (patched === content) continue;
 
+    // Staged outside the try so the cleanup below can still find it: a failed
+    // rename must not leave the staging file in the user's plugin directory.
+    let tmp = null;
     try {
       // Refuse symlinks — writing through a symlink could redirect the write
       // to an arbitrary path outside the plugin directory.
@@ -138,11 +141,17 @@ function applyOverrides(pluginRoot, env) {
       // Atomic write: stage to a sibling temp file, then rename into place.
       // Preserves the original file's mode so permission bits are not lost.
       const origMode = fs.statSync(agentPath).mode;
-      const tmp = agentPath + '.caveman-tmp-' + process.pid;
+      tmp = agentPath + '.caveman-tmp-' + process.pid;
       fs.writeFileSync(tmp, patched, { encoding: 'utf8', mode: origMode });
       fs.renameSync(tmp, agentPath);
+      tmp = null; // renamed into place — nothing staged left to remove
     } catch (e) {
-      // Silent fail — never block session start
+      // Silent fail — never block session start. The rename is the step most
+      // likely to fail for a reason the hook cannot control (EPERM from an
+      // open handle on Windows, EACCES on a read-only parent), and it runs on
+      // every SessionStart, so a staged file left behind accumulates one copy
+      // per pid next to the agent files.
+      if (tmp) { try { fs.unlinkSync(tmp); } catch (_) {} }
     }
   }
 }

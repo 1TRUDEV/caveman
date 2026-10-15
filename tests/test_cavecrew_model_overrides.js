@@ -378,6 +378,29 @@ test('applyOverrides leaves no .caveman-tmp-* file after a successful write', ()
   });
 });
 
+test('applyOverrides removes the staged temp file when the rename fails', () => {
+  withTmpPlugin((root, agentsDir) => {
+    const agentPath = path.join(agentsDir, 'cavecrew-reviewer.md');
+    fs.writeFileSync(agentPath, REVIEWER_FM, 'utf8');
+    // A rename can fail for reasons the hook cannot control: on Windows an
+    // open handle on the target gives EPERM, and a read-only parent gives
+    // EACCES. applyOverrides swallows it (it must never block session start),
+    // so the staged file has to be cleaned up on the way out or it
+    // accumulates one copy per pid in the user's plugin directory.
+    const realRename = fs.renameSync;
+    fs.renameSync = () => { const e = new Error('EPERM: operation not permitted'); e.code = 'EPERM'; throw e; };
+    try {
+      applyOverrides(root, { CAVECREW_REVIEWER_MODEL: 'sonnet' });
+    } finally {
+      fs.renameSync = realRename;
+    }
+    const leftovers = fs.readdirSync(agentsDir).filter((f) => f.includes('.caveman-tmp-'));
+    assert.deepEqual(leftovers, [], 'staged temp file left behind: ' + leftovers.join(', '));
+    assert.strictEqual(fs.readFileSync(agentPath, 'utf8'), REVIEWER_FM,
+      'original agent file must survive a failed rename unchanged');
+  });
+});
+
 console.log('');
 if (failed === 0) {
   console.log('All ' + (passed + failed) + ' tests passed.');
