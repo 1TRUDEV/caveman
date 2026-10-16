@@ -321,9 +321,11 @@ export default function (pi: ExtensionAPI) {
       // pays full token cost with nothing to show for it (#1287). Say so once.
       // A session that never reached a runtime already got the "native runtime
       // unreachable" notice above, so gate on reachable to avoid saying it twice.
+      // One empty reply can also just be a hook that outran HOOK_TIMEOUT_MS, and
+      // every later result is still attempted, so hedge rather than assert.
       if (!runtimeReachable || warnedNoReply) return;
       warnedNoReply = true;
-      notify(ctx, "Caveman: tool-output shrinking is off this session (the native runtime gave no reply)", "warning");
+      notify(ctx, "Caveman: tool-output shrinking may be off this session (the native runtime gave no reply)", "warning");
     })));
 
   pi.on("session_before_compact", GUARD_session_before_compact(() => { void bridge.call("PreCompact", { session_id: sessionId }); }));
