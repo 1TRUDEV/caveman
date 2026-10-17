@@ -236,12 +236,19 @@ type decisionResult struct {
 // every native.sock connection with an empty reply seconds after the hook had
 // already failed open, and every queued event behind it did the same).
 func (r *Runtime) Handle(ctx context.Context, request Request) (Response, error) {
-	if err := ctx.Err(); err != nil {
+	// session.end is the one event whose effects outlive the hook: its receipt
+	// and archive must land even when its decision cannot reach the host. It
+	// waits for the stripe inside the drain instead of giving up at the
+	// deadline, so a session ending behind a slow event is still archived.
+	finalize := request.Event.Type == "session.end"
+	if err := ctx.Err(); err != nil && !finalize {
 		return Response{}, fmt.Errorf("native runtime: hook budget exhausted before %s: %w", request.Event.Type, err)
 	}
 	sessionLock := r.sessionLock(request.Session.ID)
-	if err := acquireSessionLock(ctx, sessionLock); err != nil {
-		return Response{}, err
+	if !finalize {
+		if err := acquireSessionLock(ctx, sessionLock); err != nil {
+			return Response{}, err
+		}
 	}
 	// The decision runs on its own goroutine so the deadline bounds it from the
 	// outside: when the budget dies, Handle returns fail-open immediately and
@@ -251,6 +258,9 @@ func (r *Runtime) Handle(ctx context.Context, request Request) (Response, error)
 	// whatever the drain still has in flight.
 	out := make(chan decisionResult, 1)
 	go func() {
+		if finalize {
+			sessionLock.Lock()
+		}
 		defer sessionLock.Unlock()
 		response, err := r.respond(ctx, request)
 		out <- decisionResult{response: response, err: err}
@@ -295,7 +305,7 @@ func acquireSessionLock(ctx context.Context, lock *sync.Mutex) error {
 // ended is always archived.
 func (r *Runtime) respond(ctx context.Context, request Request) (Response, error) {
 	started := time.Now()
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil && request.Event.Type != "session.end" {
 		return Response{}, err
 	}
 	if request.ProtocolVersion != ProtocolVersion {

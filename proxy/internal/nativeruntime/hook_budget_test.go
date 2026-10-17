@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,5 +201,70 @@ func TestFreshStoreSocketAnswersDecisionWellWithinBudget(t *testing.T) {
 	t.Logf("fresh-home session.start decision in %s", elapsed)
 	if elapsed > 50*time.Millisecond {
 		t.Fatalf("fresh home answered in %s; want well under the %s hook budget", elapsed, hookDeadline)
+	}
+}
+
+// TestSessionEndBehindSlowEventIsStillArchived pins the one event the deadline
+// must not drop: a session.end that arrives while the session stripe is held by
+// an event draining a contended store call is finalized once the stripe frees,
+// even though its own hook budget died waiting.
+func TestSessionEndBehindSlowEventIsStillArchived(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ccr.db")
+	store, err := ccr.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime := New(store)
+	session := Session{ID: "ending-behind-drain"}
+	if _, err := runtime.Handle(context.Background(), Request{
+		ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session,
+		Event: Event{Type: "tool.after"},
+		Tool:  &Tool{Name: "Bash", Input: json.RawMessage(`{"command":"ls"}`), Output: []byte(strings.Repeat("safe result\n", 300))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := sql.Open("sqlite", ccr.SQLiteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	holder.SetMaxOpenConns(1)
+	conn, err := holder.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	slowCtx, slowCancel := context.WithTimeout(context.Background(), hookDeadline)
+	defer slowCancel()
+	if _, err := runtime.Handle(slowCtx, Request{ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session, Event: Event{Type: "prompt.submit"}}); err == nil {
+		t.Fatal("write-locked store produced a decision; want a fail-open error")
+	}
+	endCtx, endCancel := context.WithTimeout(context.Background(), hookDeadline)
+	defer endCancel()
+	_, _ = runtime.Handle(endCtx, Request{ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session, Event: Event{Type: "session.end"}})
+	if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		objects, err := store.ListSessionObjects(session.ID, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archived := len(objects) > 0
+		for _, object := range objects {
+			archived = archived && object.Lifecycle == ccr.LifecycleArchived
+		}
+		if archived {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session.end behind a draining event was dropped: %d objects not all archived", len(objects))
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
