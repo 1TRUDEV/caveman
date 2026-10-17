@@ -50,11 +50,12 @@ func unwrapCodexExec(input []byte) ([]byte, codexExecWrapper) {
 		if bytes.HasPrefix(line, []byte(`{"`)) && bytes.HasSuffix(line, []byte(`"}`)) {
 			if key := bytes.LastIndex(line, codexOutputKey); key > 0 && hasCodexKey(line[:key]) {
 				raw := line[key+len(codexOutputKey) : len(line)-2]
-				var value string
-				quoted := make([]byte, 0, len(raw)+2)
-				quoted = append(append(append(quoted, '"'), raw...), '"')
-				if len(raw) > len(best) && json.Unmarshal(quoted, &value) == nil && value != "" {
-					best, bestStart, bestEnd = []byte(value), start+key+len(codexOutputKey), start+len(line)-2
+				if len(raw) > len(best) {
+					var value string
+					quoted := append(append([]byte{'"'}, raw...), '"')
+					if json.Unmarshal(quoted, &value) == nil && value != "" {
+						best, bestStart, bestEnd = []byte(value), start+key+len(codexOutputKey), start+len(line)-2
+					}
 				}
 			}
 		}
