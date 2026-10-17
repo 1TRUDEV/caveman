@@ -40,7 +40,7 @@ func TestCROnlyDocumentPipelineAndDetection(t *testing.T) {
 	defer store.Close()
 	e := engine.New(store, nil)
 
-	// 84-byte classic-Mac (CR-terminated) payload with multiple bare CRs and 0 LFs
+	// Classic-Mac (CR-terminated) payload with multiple bare CRs and 0 LFs
 	in := []byte("Classic Mac document line one\rline two with more text\rline three here\rline four footer\r")
 
 	// Detect must not return terminal
@@ -55,6 +55,11 @@ func TestCROnlyDocumentPipelineAndDetection(t *testing.T) {
 	}
 	if res.ContentType == engine.TypeTerminal {
 		t.Errorf("CR-only compressed as terminal: %q", res.ContentType)
+	}
+	for _, line := range bytes.Split(bytes.TrimSuffix(in, []byte("\r")), []byte("\r")) {
+		if !bytes.Contains(res.Output, line) {
+			t.Errorf("CR-terminated line %q lost: %q", line, res.Output)
+		}
 	}
 }
 
