@@ -281,8 +281,8 @@ func TestSessionEndDoesNotOvertakeAQueuedEvent(t *testing.T) {
 	defer store.Close()
 	runtime := New(store)
 	session := Session{ID: "end-keeps-its-place"}
-	stripe := runtime.sessionLock(session.ID)
-	stripe.Lock()
+	stripe := runtime.sessionStripe(session.ID)
+	stripe <- struct{}{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -301,7 +301,7 @@ func TestSessionEndDoesNotOvertakeAQueuedEvent(t *testing.T) {
 		_, _ = runtime.Handle(ctx, Request{ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session, Event: Event{Type: "session.end"}})
 	}()
 	time.Sleep(30 * time.Millisecond)
-	stripe.Unlock()
+	<-stripe
 	wg.Wait()
 	objects, err := store.ListSessionObjects(session.ID, 100)
 	if err != nil {
@@ -327,14 +327,14 @@ func TestStateOnlyEventStillRunsAfterTheDeadline(t *testing.T) {
 	defer store.Close()
 	runtime := New(store)
 	child := Session{ID: "child-behind-slow-stripe", ParentSessionID: "parent"}
-	stripe := runtime.sessionLock(child.ID)
-	stripe.Lock()
+	stripe := runtime.sessionStripe(child.ID)
+	stripe <- struct{}{}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, err := runtime.Handle(ctx, Request{ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "codex"}, Session: child, Event: Event{Type: "subagent.start"}}); err == nil {
 		t.Fatal("held stripe produced a decision inside the budget")
 	}
-	stripe.Unlock()
+	<-stripe
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		objects, err := store.ListSessionObjects(child.ID, 100)
@@ -350,5 +350,37 @@ func TestStateOnlyEventStillRunsAfterTheDeadline(t *testing.T) {
 			t.Fatalf("subagent.start was dropped at the deadline: %d objects, none native:subagent-active", len(objects))
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A host-visible event whose budget runs out while it waits for the stripe
+// does no store work afterwards: the host has already failed open.
+func TestExpiredWaiterLeavesTheQueueWithoutStoreWork(t *testing.T) {
+	store, err := ccr.Open(filepath.Join(t.TempDir(), "ccr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime := New(store)
+	session := Session{ID: "expired-waiter"}
+	stripe := runtime.sessionStripe(session.ID)
+	stripe <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := runtime.Handle(ctx, Request{
+		ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session,
+		Event: Event{Type: "tool.after"},
+		Tool:  &Tool{Name: "Bash", Input: json.RawMessage(`{"command":"ls"}`), Output: []byte(strings.Repeat("safe result\n", 300))},
+	}); err == nil {
+		t.Fatal("held stripe produced a decision inside the budget")
+	}
+	<-stripe
+	time.Sleep(100 * time.Millisecond)
+	objects, err := store.ListSessionObjects(session.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 0 {
+		t.Fatalf("expired waiter wrote %d objects after its deadline", len(objects))
 	}
 }

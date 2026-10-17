@@ -104,7 +104,7 @@ type Runtime struct {
 	receiptDir            string
 	usage                 sessionusage.Reader
 	mu                    sync.Mutex // activeSessions and lastActivity only
-	sessionLocks          [64]sync.Mutex
+	sessionStripes        [64]chan struct{}
 	repositoryMu          sync.RWMutex
 	repositoryMaps        map[string]*repositoryMapEntry
 	repositorySessionRefs map[string]repositorySessionRef
@@ -150,13 +150,17 @@ type repositoryMapEntry struct {
 }
 
 func newRuntime(store *ccr.Store) *Runtime {
-	return &Runtime{
+	runtime := &Runtime{
 		store: store, repositoryMaps: map[string]*repositoryMapEntry{},
 		repositorySessionRefs: map[string]repositorySessionRef{}, repositoryWarming: map[string]bool{}, repositoryEnded: map[string]time.Time{},
 		activeSessions: map[string]sessionActivity{}, lastActivity: time.Now(),
 		// A store-less engine: Detect reads only the bytes handed to it.
 		detect: engine.New(nil, nil).Detect,
 	}
+	for i := range runtime.sessionStripes {
+		runtime.sessionStripes[i] = make(chan struct{}, 1)
+	}
+	return runtime
 }
 
 func New(store *ccr.Store) *Runtime { return newRuntime(store) }
@@ -242,16 +246,24 @@ func (r *Runtime) Handle(ctx context.Context, request Request) (Response, error)
 	}
 	// The decision runs on its own goroutine so the deadline bounds it from the
 	// outside: when the budget dies, Handle returns fail-open immediately and
-	// the drain finishes or skips the store work in the background. The drain
-	// takes the session stripe itself, with a blocking Lock, so events for one
-	// session still run in arrival order: a waiter that outlives its budget
-	// takes its turn and returns at respond's dead-budget check, and a later
-	// session.end cannot overtake an event queued before it.
-	sessionLock := r.sessionLock(request.Session.ID)
+	// the drain finishes the store work in the background. The drain queues
+	// for the session stripe itself, and a channel serves its waiters in
+	// arrival order, so a later session.end cannot overtake an event queued
+	// before it. A waiter whose budget dies leaves the queue (and frees its
+	// payload) at its deadline; the state-only events stay queued and run.
+	stripe := r.sessionStripe(request.Session.ID)
 	out := make(chan decisionResult, 1)
 	go func() {
-		sessionLock.Lock()
-		defer sessionLock.Unlock()
+		if mustRun {
+			stripe <- struct{}{}
+		} else {
+			select {
+			case stripe <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		defer func() { <-stripe }()
 		response, err := r.respond(ctx, request)
 		out <- decisionResult{response: response, err: err}
 	}()
@@ -431,19 +443,18 @@ func (r *Runtime) respond(ctx context.Context, request Request) (Response, error
 	return response, nil
 }
 
-// sessionLock preserves event order within one session without making unrelated
+// sessionStripe preserves event order within one session without making unrelated
 // coding-agent sessions spend their shared 250 ms hook budget waiting on each
 // other's repository and CCR work. Fixed stripes bound lock memory for a
 // long-lived runtime; hash collisions only serialize, never weaken isolation.
-// A waiter whose hook deadline passes keeps its place and skips its work when
-// its turn comes (respond's dead-budget check), so it costs no store time.
-func (r *Runtime) sessionLock(sessionID string) *sync.Mutex {
+// Each stripe is a one-slot channel: holding it is a value in the buffer.
+func (r *Runtime) sessionStripe(sessionID string) chan struct{} {
 	var hash uint32 = 2166136261
 	for i := 0; i < len(sessionID); i++ {
 		hash ^= uint32(sessionID[i])
 		hash *= 16777619
 	}
-	return &r.sessionLocks[hash%uint32(len(r.sessionLocks))]
+	return r.sessionStripes[hash%uint32(len(r.sessionStripes))]
 }
 
 func directOutputRewriteAgent(agentID string) bool {
