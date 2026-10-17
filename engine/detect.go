@@ -37,6 +37,9 @@ var (
 	// A raw ANSI/CSI escape is the conclusive terminal signal — nothing but
 	// terminal/command output legitimately embeds one.
 	ansiEscRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+	// htmlDeclarationRe matches a document declaration or an <html> tag, not
+	// <htmlReport> or any other tag that merely starts with the same letters.
+	htmlDeclarationRe = regexp.MustCompile(`(?i)^(<!doctype\s+html|<html[\s>/])`)
 )
 
 // Detect classifies a payload into a content type. It is deterministic and
@@ -62,6 +65,13 @@ func (e *Engine) Detect(input []byte) string {
 	// and the native runtime does not mask test-report output.
 	if looksLikeJUnitXML(trimmed) && compressors.LooksTestReport(trimmed) {
 		return TypeTestReport
+	}
+	// A page saved with a few stray carriage returns among its CRLF line ends is
+	// still a page: its document declaration outranks the bare-CR count below,
+	// which would otherwise route it to the terminal compressor. An ANSI escape
+	// stays conclusive for terminal output either way.
+	if hasHTMLDeclaration(trimmed) && !ansiEscRe.Match(input) {
+		return TypeHTML
 	}
 	// Terminal output is detected before diff/code/log because its ANSI-escape
 	// signal is conclusive: only raw command/terminal output carries it, so this
@@ -149,8 +159,7 @@ func looksLikeCode(input []byte) bool {
 // text-extracted into garbage. Low confidence falls open to the next detector.
 func looksLikeHTML(input []byte) bool {
 	s := bytes.ToLower(bytes.TrimSpace(input))
-	// A document declaration is conclusive — source code never starts this way.
-	if bytes.HasPrefix(s, []byte("<!doctype html")) || bytes.HasPrefix(s, []byte("<html")) {
+	if hasHTMLDeclaration(s) {
 		return true
 	}
 	// Fragments: bail if it's source code embedding markup (JSX, HTML literals).
@@ -163,6 +172,12 @@ func looksLikeHTML(input []byte) bool {
 		bytes.Contains(s, []byte("<div")) ||
 		bytes.Contains(s, []byte("<p>")) || bytes.Contains(s, []byte("<p "))
 	return hasContainer && bytes.Count(s, []byte("<")) >= 6
+}
+
+// hasHTMLDeclaration reports whether trimmed opens with a document declaration
+// or an <html> tag. It is conclusive: source code never starts this way.
+func hasHTMLDeclaration(trimmed []byte) bool {
+	return htmlDeclarationRe.Match(trimmed[:min(len(trimmed), 32)])
 }
 
 // hasCodeStructure reports whether the payload carries source-code syntax that an
