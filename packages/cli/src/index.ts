@@ -7844,6 +7844,37 @@ export function hookExecutableInvocation(
   return platform === "win32" && powershell ? `& ${invocation}` : invocation;
 }
 
+// hostShellInvocation renders the same invocation for a command string we hand
+// BACK to the host for the host's own shell to run — a `shrink` rewrite, not a
+// hook the host dispatches itself. That shell differs per host on Windows: Git
+// Bash under Claude Code, PowerShell under the opencode plugin, cmd.exe under
+// Gemini CLI, and the three share no quoting syntax. A quoted path is only a
+// string literal in PowerShell, so the quoted prefix died with
+// `ParserError: Unexpected token 'shrink'` before the command ran (#1263);
+// single quotes are literal characters in cmd.exe; and the `&` call operator
+// PowerShell needs is a syntax error in bash. An unquoted, forward-slashed path
+// is the one form all three execute, so emit that when every component allows
+// it and return null when one does not — a path with a space has no portable
+// form at all, and the caller then declines the rewrite, which leaves the
+// command running exactly as the host sent it. POSIX hosts all run an sh-family
+// shell, where the quoted form is both correct and space-safe: unchanged there.
+const BARE_HOST_SHELL_PATH = /^[A-Za-z0-9_:./-]+$/;
+export function hostShellInvocation(
+  executable: string,
+  script: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const parts = script ? [executable, script] : [executable];
+  if (platform !== "win32") return parts.map((part) => quoteHookPath(part, platform)).join(" ");
+  const bare: string[] = [];
+  for (const part of parts) {
+    const normalized = normalizeHookPath(part, platform);
+    if (!BARE_HOST_SHELL_PATH.test(normalized)) return null;
+    bare.push(normalized);
+  }
+  return bare.join(" ");
+}
+
 function nativeHookCommand(agentId: string): string {
   const fastHook = join(dirname(fileURLToPath(import.meta.url)), "native-hook-fast.js");
   const explicitProxy = process.env.CAVEMAN_PROXY_BIN;
@@ -16655,12 +16686,14 @@ function shouldShrink(command: string): boolean {
   return SHRINK_ALLOW.has(first);
 }
 
-// cavemanBinForHook is the invocation a Claude hook uses to call back into this
-// CLI, robust to PATH: a resolved `caveman`/`cave`, else this very script's node.
-function cavemanBinForHook(powershell: boolean = process.platform === "win32"): string {
+// cavemanHookTarget resolves what a hook runs to call back into this CLI, robust
+// to PATH: a resolved `caveman`/`cave`, else this very script's node. Rendering it
+// into a command string is the caller's job, because the two callers target
+// different shells (see hookExecutableInvocation vs hostShellInvocation).
+function cavemanHookTarget(): { executable: string; script?: string } {
   // Never a package runner's cached copy when a lasting one exists.
   const command = durableCaveman() ?? which("caveman") ?? which("cave");
-  if (!command) return hookExecutableInvocation(stableNodePath(), process.argv[1]!, process.platform, powershell);
+  if (!command) return { executable: stableNodePath(), script: process.argv[1]! };
   // npm links `caveman` to a `#!/usr/bin/env node` script, and a host started
   // from a GUI or launchd often has no node on PATH (nvm, volta, Homebrew):
   // run it with this node, named as the lifecycle hooks name theirs (`--node`)
@@ -16670,9 +16703,22 @@ function cavemanBinForHook(powershell: boolean = process.platform === "win32"): 
   try {
     script = hookCommandBasename(process.execPath) === "node" && /\.[cm]?js$/.test(realpathSync(command));
   } catch { /* unresolvable: run it as found */ }
-  return script
-    ? hookExecutableInvocation(stableNodePath(), command, process.platform, powershell)
-    : hookExecutableInvocation(command, undefined, process.platform, powershell);
+  return script ? { executable: stableNodePath(), script: command } : { executable: command };
+}
+
+// cavemanBinForHook is that invocation as the HOST will dispatch it — on native
+// Windows the hosts run command hooks through PowerShell, which needs `&`.
+function cavemanBinForHook(powershell: boolean = process.platform === "win32"): string {
+  const target = cavemanHookTarget();
+  return hookExecutableInvocation(target.executable, target.script, process.platform, powershell);
+}
+
+// cavemanBinForHostShell is that invocation for the host's OWN shell, which we do
+// not know. null = no portable form; the caller must decline rather than emit a
+// command one of the three Windows shells cannot parse (#1263).
+function cavemanBinForHostShell(): string | null {
+  const target = cavemanHookTarget();
+  return hostShellInvocation(target.executable, target.script, process.platform);
 }
 
 // shrinkHook is the settings-hook callback for the agents whose harness can
@@ -16706,9 +16752,15 @@ async function shrinkHook() {
   if (!isGemini && !isBash) process.exit(0);
   const command = evt.tool_input?.command;
   if (typeof command !== "string" || !shouldShrink(command)) process.exit(0);
-  // updatedInput.command executes in host shell (Git Bash on Claude Windows),
-  // not hook's explicit PowerShell shell. Never leak PowerShell `&` into it.
-  const rewritten = `${cavemanBinForHook(false)} shrink -- ${command.trim()}`;
+  // updatedInput.command executes in the host's own shell — Git Bash under Claude
+  // Code on Windows, PowerShell under the opencode plugin, cmd.exe under Gemini —
+  // never the hook's explicit PowerShell shell, so this prefix is rendered bare
+  // rather than quoted or `&`-prefixed. When no form serves all three (a space in
+  // the path), there is no rewrite: the command runs as the host sent it, which is
+  // the same safe direction as every other decline above.
+  const prefix = cavemanBinForHostShell();
+  if (!prefix) process.exit(0);
+  const rewritten = `${prefix} shrink -- ${command.trim()}`;
   // Gemini merges hookSpecificOutput.tool_input (snake_case, no event discriminator);
   // Claude REPLACES via hookSpecificOutput.updatedInput (camelCase + hookEventName).
   // Because Claude replaces, updatedInput must carry every field the host sent —
