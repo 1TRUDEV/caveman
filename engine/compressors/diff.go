@@ -93,7 +93,10 @@ var diffExtendedHeaderPrefixes = [][]byte{
 	[]byte("deleted file mode "),
 	[]byte("Binary files "),
 	[]byte("GIT binary patch"),
-	[]byte("\\ No newline at end of file"),
+	// Only the backslash is fixed: GNU diff translates the text after it
+	// ("\ Kein Zeilenumbruch am Dateiende."), so git apply and patch key off
+	// the backslash alone, and no hunk line can start with one.
+	[]byte("\\"),
 }
 
 // isDiffExtendedHeaderLine reports whether line is one of git's extended

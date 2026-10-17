@@ -67,22 +67,25 @@ func TestDiffCompressorKeepsBlankLineChanges(t *testing.T) {
 // A file whose last line has no trailing newline is annotated by git with
 // "\ No newline at end of file". It is metadata, not context, but it landed
 // outside the keep window and was replaced by an elision marker — the diff
-// stopped saying that the file is unterminated.
+// stopped saying that the file is unterminated. GNU diff translates the text
+// after the backslash, so a localized marker must survive too.
 func TestDiffCompressorKeepsNoNewlineMarker(t *testing.T) {
-	var b strings.Builder
-	b.WriteString("diff --git a/app.go b/app.go\nindex 111..222 100644\n--- a/app.go\n+++ b/app.go\n@@ -1,20 +1,20 @@\n unchanged line 01\n unchanged line 02\n")
-	b.WriteString("-old_value = 1\n+new_value = 2\n")
-	for i := 3; i < 12; i++ {
-		fmt.Fprintf(&b, " unchanged line %02d\n", i)
-	}
-	b.WriteString("\\ No newline at end of file\n")
+	for _, marker := range []string{"\\ No newline at end of file", "\\ Kein Zeilenumbruch am Dateiende."} {
+		var b strings.Builder
+		b.WriteString("diff --git a/app.go b/app.go\nindex 111..222 100644\n--- a/app.go\n+++ b/app.go\n@@ -1,20 +1,20 @@\n unchanged line 01\n unchanged line 02\n")
+		b.WriteString("-old_value = 1\n+new_value = 2\n")
+		for i := 3; i < 12; i++ {
+			fmt.Fprintf(&b, " unchanged line %02d\n", i)
+		}
+		b.WriteString(marker + "\n")
 
-	out, ok := compressors.NewDiff().Compress([]byte(b.String()))
-	if !ok {
-		t.Fatal("expected diff compression")
-	}
-	if !bytes.Contains(out, []byte("\\ No newline at end of file")) {
-		t.Fatalf("compressed diff dropped the no-newline marker:\n%s", out)
+		out, ok := compressors.NewDiff().Compress([]byte(b.String()))
+		if !ok {
+			t.Fatal("expected diff compression")
+		}
+		if !bytes.Contains(out, []byte(marker)) {
+			t.Fatalf("compressed diff dropped the no-newline marker %q:\n%s", marker, out)
+		}
 	}
 }
 
