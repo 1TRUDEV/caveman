@@ -120,23 +120,18 @@ func piField(usage map[string]any, keys ...string) (int64, bool) {
 	return 0, false
 }
 
+// piContextTotal is the prompt size, matching the sibling sources: pi-ai's
+// buckets are disjoint, so it is input + cacheRead + cacheWrite. totalTokens is
+// not used because pi-ai adds output into it.
 func piContextTotal(usage map[string]any) (int, bool) {
 	if len(usage) == 0 {
 		return 0, false
 	}
-	total, ok := piField(usage, "totalTokens", "total_tokens", "input_total_tokens")
-	if !ok || total <= 0 {
-		input, _ := piField(usage, "input", "input_tokens")
-		cacheRead, _ := piField(usage, "cacheRead", "cache_read")
-		cacheWrite, _ := piField(usage, "cacheWrite", "cache_write", "cache_creation", "cacheCreation")
-		output, _ := piField(usage, "output", "output_tokens")
-		sum, ok := checkedNonNegativeSum(input, cacheRead, cacheWrite, output)
-		if !ok {
-			return 0, false
-		}
-		total = sum
-	}
-	if total <= 0 || total > math.MaxInt {
+	input, _ := piField(usage, "input", "input_tokens")
+	cacheRead, _ := piField(usage, "cacheRead", "cache_read")
+	cacheWrite, _ := piField(usage, "cacheWrite", "cache_write", "cache_creation", "cacheCreation")
+	total, ok := checkedNonNegativeSum(input, cacheRead, cacheWrite)
+	if !ok || total <= 0 || total > math.MaxInt {
 		return 0, false
 	}
 	return int(total), true
@@ -164,23 +159,17 @@ func piBillingUsage(usage map[string]any) (fresh, output int, present bool) {
 	if len(usage) == 0 {
 		return 0, 0, false
 	}
-	input64, hasInput := piField(usage, "input", "input_tokens")
-	cached64, _ := piField(usage, "cacheRead", "cache_read")
+	// pi-ai already normalizes every provider to DISJOINT buckets (its OpenAI,
+	// Google and Anthropic adapters subtract the cached share before storing
+	// input), so input is the fresh bucket as-is, like claude/opencode.
+	fresh64, hasInput := piField(usage, "input", "input_tokens")
 	out64, hasOutput := piField(usage, "output", "output_tokens")
 	if !hasInput && !hasOutput {
 		return 0, 0, false
 	}
-	if input64 < 0 || cached64 < 0 || out64 < 0 {
+	if fresh64 < 0 || out64 < 0 {
 		return 0, 0, false
 	}
-	// Pi's prompt count is inclusive of the cached share (OpenAI-style), so the
-	// fresh bucket is the difference; a cached share larger than the total is
-	// clamped rather than emitted as a negative.
-	fresh64 := input64
-	if cached64 > fresh64 {
-		fresh64 = cached64
-	}
-	fresh64 -= cached64
 	if fresh64 == 0 && out64 == 0 {
 		return 0, 0, false
 	}

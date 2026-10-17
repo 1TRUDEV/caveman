@@ -42,7 +42,9 @@ func writePiSessionFixture(t *testing.T, root string, index int, humanBlock, too
 			"usage": map[string]any{
 				// Both spellings of the cache fields are present on purpose;
 				// a parser that sums them would double-count the cached share.
-				"input": 800000, "output": 100,
+				// pi-ai stores disjoint buckets: input excludes the cached
+				// share, and totalTokens = input+output+cacheRead+cacheWrite.
+				"input": 3000, "output": 100,
 				"cacheRead": 700000, "cache_read": 424242,
 				"cacheWrite": 1000, "cacheCreation": 999999,
 				"totalTokens": 704100,
@@ -128,14 +130,14 @@ func TestPiSessionSourceReadsUsageAndCompletesToolCalls(t *testing.T) {
 	if usage.Model != "claude-sonnet-4-5" || usage.ProviderKey != "anthropic" || usage.Repo != "/repo/pi" {
 		t.Fatalf("normalized usage event = %+v, want model/provider/repo from the assistant message", usage)
 	}
-	if usage.ContextTotal != 704100 {
-		t.Fatalf("ContextTotal = %d, want reported totalTokens 704100", usage.ContextTotal)
+	if usage.ContextTotal != 704000 {
+		t.Fatalf("ContextTotal = %d, want prompt size input+cacheRead+cacheWrite 704000 (output excluded)", usage.ContextTotal)
 	}
 	if !usage.CacheUsagePresent || usage.CacheReadInputTokens != 700000 || usage.CacheCreationInputTokens != 1000 {
 		t.Fatalf("cache = %d/%d present=%v, want first-present spelling 700000/1000 (never summed)", usage.CacheReadInputTokens, usage.CacheCreationInputTokens, usage.CacheUsagePresent)
 	}
-	if !usage.BillingUsagePresent || usage.InputFreshTokens != 100000 || usage.OutputTokens != 100 {
-		t.Fatalf("billing = fresh %d out %d, want 100000/100", usage.InputFreshTokens, usage.OutputTokens)
+	if !usage.BillingUsagePresent || usage.InputFreshTokens != 3000 || usage.OutputTokens != 100 {
+		t.Fatalf("billing = fresh %d out %d, want disjoint input 3000/100", usage.InputFreshTokens, usage.OutputTokens)
 	}
 	read, ok := completed["read"]
 	if !ok || completed["task"].Name != "task" {
@@ -171,15 +173,15 @@ func TestPiUsageReadsOneSpellingNeverSums(t *testing.T) {
 		t.Fatalf("piCacheUsage = (%d, %d, %v), want first-present 400/50", read, creation, ok)
 	}
 	fresh, out, ok := piBillingUsage(usage)
-	if !ok || fresh != 600 || out != 100 {
-		t.Fatalf("piBillingUsage = (%d, %d, %v), want 600/100 from first-present input minus cacheRead", fresh, out, ok)
+	if !ok || fresh != 1000 || out != 100 {
+		t.Fatalf("piBillingUsage = (%d, %d, %v), want first-present disjoint input 1000/100", fresh, out, ok)
 	}
 
 	total := map[string]any{"input": 3000, "output": 100, "cacheRead": 700000, "cacheWrite": 1000}
-	if got, ok := piContextTotal(total); !ok || got != 704100 {
-		t.Fatalf("piContextTotal fallback = (%d, %v), want summed 704100", got, ok)
+	if got, ok := piContextTotal(total); !ok || got != 704000 {
+		t.Fatalf("piContextTotal = (%d, %v), want input+cacheRead+cacheWrite 704000", got, ok)
 	}
-	if got, ok := piContextTotal(map[string]any{"totalTokens": 12345, "input": 1}); !ok || got != 12345 {
-		t.Fatalf("piContextTotal = (%d, %v), want reported totalTokens 12345 to win", got, ok)
+	if got, ok := piContextTotal(map[string]any{"totalTokens": 12345, "input": 1}); !ok || got != 1 {
+		t.Fatalf("piContextTotal = (%d, %v), want totalTokens ignored (it includes output)", got, ok)
 	}
 }
