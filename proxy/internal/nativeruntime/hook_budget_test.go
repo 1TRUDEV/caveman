@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -266,5 +267,88 @@ func TestSessionEndBehindSlowEventIsStillArchived(t *testing.T) {
 			t.Fatalf("session.end behind a draining event was dropped: %d objects not all archived", len(objects))
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// session.end queued behind an event that was already waiting for the session
+// stripe must not run first: the earlier event's capture would land after the
+// archive and stay hot forever.
+func TestSessionEndDoesNotOvertakeAQueuedEvent(t *testing.T) {
+	store, err := ccr.Open(filepath.Join(t.TempDir(), "ccr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime := New(store)
+	session := Session{ID: "end-keeps-its-place"}
+	stripe := runtime.sessionLock(session.ID)
+	stripe.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = runtime.Handle(ctx, Request{
+			ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session,
+			Event: Event{Type: "tool.after"},
+			Tool:  &Tool{Name: "Bash", Input: json.RawMessage(`{"command":"ls"}`), Output: []byte(strings.Repeat("safe result\n", 300))},
+		})
+	}()
+	time.Sleep(30 * time.Millisecond)
+	go func() {
+		defer wg.Done()
+		_, _ = runtime.Handle(ctx, Request{ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "claude"}, Session: session, Event: Event{Type: "session.end"}})
+	}()
+	time.Sleep(30 * time.Millisecond)
+	stripe.Unlock()
+	wg.Wait()
+	objects, err := store.ListSessionObjects(session.ID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) == 0 {
+		t.Fatal("tool.after captured nothing")
+	}
+	for _, object := range objects {
+		if object.Lifecycle != ccr.LifecycleArchived {
+			t.Fatalf("object %s type=%s lifecycle=%s written after session.end archived the session", object.ID, object.Type, object.Lifecycle)
+		}
+	}
+}
+
+// subagent.start sends the host nothing; its effect is the state write, so a
+// stripe held past the hook deadline delays it instead of dropping it.
+func TestStateOnlyEventStillRunsAfterTheDeadline(t *testing.T) {
+	store, err := ccr.Open(filepath.Join(t.TempDir(), "ccr.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime := New(store)
+	child := Session{ID: "child-behind-slow-stripe", ParentSessionID: "parent"}
+	stripe := runtime.sessionLock(child.ID)
+	stripe.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := runtime.Handle(ctx, Request{ProtocolVersion: ProtocolVersion, Agent: Agent{ID: "codex"}, Session: child, Event: Event{Type: "subagent.start"}}); err == nil {
+		t.Fatal("held stripe produced a decision inside the budget")
+	}
+	stripe.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		objects, err := store.ListSessionObjects(child.ID, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, object := range objects {
+			if object.Source == "native:subagent-active" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("subagent.start was dropped at the deadline: %d objects, none native:subagent-active", len(objects))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

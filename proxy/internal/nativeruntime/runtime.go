@@ -236,31 +236,21 @@ type decisionResult struct {
 // every native.sock connection with an empty reply seconds after the hook had
 // already failed open, and every queued event behind it did the same).
 func (r *Runtime) Handle(ctx context.Context, request Request) (Response, error) {
-	// session.end is the one event whose effects outlive the hook: its receipt
-	// and archive must land even when its decision cannot reach the host. It
-	// waits for the stripe inside the drain instead of giving up at the
-	// deadline, so a session ending behind a slow event is still archived.
-	finalize := request.Event.Type == "session.end"
-	if err := ctx.Err(); err != nil && !finalize {
+	mustRun := stateOnlyEvents[request.Event.Type]
+	if err := ctx.Err(); err != nil && !mustRun {
 		return Response{}, fmt.Errorf("native runtime: hook budget exhausted before %s: %w", request.Event.Type, err)
-	}
-	sessionLock := r.sessionLock(request.Session.ID)
-	if !finalize {
-		if err := acquireSessionLock(ctx, sessionLock); err != nil {
-			return Response{}, err
-		}
 	}
 	// The decision runs on its own goroutine so the deadline bounds it from the
 	// outside: when the budget dies, Handle returns fail-open immediately and
-	// the drain below finishes or abandons the in-flight store work in the
-	// background. The session stripe moves with the drain (released by its
-	// defer), so later events for this session keep their order against
-	// whatever the drain still has in flight.
+	// the drain finishes or skips the store work in the background. The drain
+	// takes the session stripe itself, with a blocking Lock, so events for one
+	// session still run in arrival order: a waiter that outlives its budget
+	// takes its turn and returns at respond's dead-budget check, and a later
+	// session.end cannot overtake an event queued before it.
+	sessionLock := r.sessionLock(request.Session.ID)
 	out := make(chan decisionResult, 1)
 	go func() {
-		if finalize {
-			sessionLock.Lock()
-		}
+		sessionLock.Lock()
 		defer sessionLock.Unlock()
 		response, err := r.respond(ctx, request)
 		out <- decisionResult{response: response, err: err}
@@ -269,31 +259,24 @@ func (r *Runtime) Handle(ctx context.Context, request Request) (Response, error)
 	case result := <-out:
 		return result.response, result.err
 	case <-ctx.Done():
+		select {
+		case result := <-out:
+			return result.response, result.err
+		default:
+		}
 		return Response{}, fmt.Errorf("native runtime: hook budget exhausted during %s: %w", request.Event.Type, ctx.Err())
 	}
 }
 
-// acquireSessionLock takes the session stripe or gives up when the hook
-// deadline expires. TryLock polling keeps a session whose previous event is
-// still draining a blocked store call from stacking unbounded waiters on the
-// stripe for seconds.
-func acquireSessionLock(ctx context.Context, lock *sync.Mutex) error {
-	if lock.TryLock() {
-		return nil
-	}
-	tick := time.NewTimer(time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("native runtime: hook budget exhausted waiting for session: %w", ctx.Err())
-		case <-tick.C:
-			if lock.TryLock() {
-				return nil
-			}
-			tick.Reset(time.Millisecond)
-		}
-	}
+// stateOnlyEvents send the host nothing it acts on; their whole effect is the
+// store write (archive and receipt, compaction transition, subagent state and
+// evidence merge). They run to completion on the drain even after the hook
+// deadline, because the host has already moved on and will not resend them.
+var stateOnlyEvents = map[string]bool{
+	"session.end":            true,
+	"context.compact.before": true,
+	"subagent.start":         true,
+	"subagent.stop":          true,
 }
 
 // respond is the decision body Handle drains on its goroutine. The context
@@ -301,11 +284,11 @@ func acquireSessionLock(ctx context.Context, lock *sync.Mutex) error {
 // response can no longer reach the host, so pending store writes are skipped
 // instead of queued behind the wedged store connection. Work already in flight
 // still finishes (idempotent writes, single-connection ordering), and
-// session.end finalization runs even on a dead budget so a session the host
+// stateOnlyEvents run even on a dead budget so, for one, a session the host
 // ended is always archived.
 func (r *Runtime) respond(ctx context.Context, request Request) (Response, error) {
 	started := time.Now()
-	if err := ctx.Err(); err != nil && request.Event.Type != "session.end" {
+	if err := ctx.Err(); err != nil && !stateOnlyEvents[request.Event.Type] {
 		return Response{}, err
 	}
 	if request.ProtocolVersion != ProtocolVersion {
@@ -452,8 +435,8 @@ func (r *Runtime) respond(ctx context.Context, request Request) (Response, error
 // coding-agent sessions spend their shared 250 ms hook budget waiting on each
 // other's repository and CCR work. Fixed stripes bound lock memory for a
 // long-lived runtime; hash collisions only serialize, never weaken isolation.
-// Waiters still give up at their own hook deadline (acquireSessionLock) instead
-// of queueing for the full drain of a blocked event.
+// A waiter whose hook deadline passes keeps its place and skips its work when
+// its turn comes (respond's dead-budget check), so it costs no store time.
 func (r *Runtime) sessionLock(sessionID string) *sync.Mutex {
 	var hash uint32 = 2166136261
 	for i := 0; i < len(sessionID); i++ {
