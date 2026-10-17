@@ -4,15 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/JuliusBrussee/caveman/browse"
@@ -23,10 +26,20 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Before runDirect, which opens the recovery store.
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		runVersion(os.Args[2:], os.Stdout)
+		return
+	}
 	if len(os.Args) > 1 {
 		runDirect(logger, os.Args[1:])
 		return
 	}
+
+	// Installed before Chrome launches: a signal during startup is held until
+	// runUntilSignal sees it, so the deferred Close calls below still run.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer cancel()
 
 	store, err := openRecoveryStore()
 	if err != nil {
@@ -52,9 +65,41 @@ func main() {
 	defer session.Close()
 
 	srv := mcp.NewServer("caveman-browse", browse.BrowserTools(session), logger)
-	if err := srv.Serve(os.Stdin, os.Stdout); err != nil {
+	if err := runUntilSignal(ctx, srv, os.Stdin, os.Stdout); err != nil {
 		logger.Error("serve", "err", err)
 		os.Exit(1)
+	}
+}
+
+// version is the build version (go build -ldflags "-X main.version=...").
+var version = "dev"
+
+// runVersion prints the version, or with --json {version, schema, capabilities}: the
+// shape every caveman binary answers so the CLI can probe what a build supports.
+// The capabilities are the MCP server (no arguments) and its direct commands.
+func runVersion(args []string, stdout io.Writer) {
+	if len(args) > 0 && args[0] == "--json" {
+		_ = json.NewEncoder(stdout).Encode(map[string]any{
+			"version":      version,
+			"schema":       "caveman.browse.version.v1",
+			"capabilities": []string{"mcp", "snapshot", "act", "eval", "recover", "close"},
+		})
+		return
+	}
+	fmt.Fprintln(stdout, version)
+}
+
+// runUntilSignal returns as soon as srv.Serve finishes or ctx is done, instead of
+// blocking on it directly: an unwrapped call cannot be interrupted by a signal, so
+// main's deferred Close calls never run and the browser is orphaned.
+func runUntilSignal(ctx context.Context, srv *mcp.Server, in io.Reader, out io.Writer) error {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(in, out) }()
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
 }
 

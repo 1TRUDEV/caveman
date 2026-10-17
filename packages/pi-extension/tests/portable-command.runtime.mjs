@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const { portableInvocation, parseWindowsNodeShim } = await import("../dist/portable-command.mjs")
+const { portableInvocation, parseWindowsExeShim, parseWindowsNodeShim } = await import("../dist/portable-command.mjs")
   .catch(() => import("../src/portable-command.ts"));
 
 function fixture() {
@@ -24,6 +24,34 @@ function fixture() {
   mkdirSync(bin, { recursive: true });
   return { root, bin };
 }
+
+test("win32: managed Pi's Node command shim is parsed", () => {
+  assert.equal(parseWindowsNodeShim('@ECHO off\r\nnode "%~dp0pi-launcher.js" %*\r\n'), "pi-launcher.js");
+});
+
+test("win32: nested cmd → bat → JS is unwrapped without a shell", () => {
+  const { root, bin } = fixture();
+  try {
+    const nested = join(bin, "nested.bat");
+    const target = join(root, "package space", "cli.cjs");
+    mkdirSync(join(root, "package space"));
+    writeFileSync(target, "// fixture\n");
+    writeFileSync(nested, 'node "%~dp0\\..\\package space\\cli.cjs" %*\r\n');
+    const shim = join(bin, "pi.CMD");
+    writeFileSync(shim, '@ECHO off\r\n"%~dp0nested.bat" %*\r\n');
+    const args = ["a & %PATH%"];
+    assert.deepEqual(portableInvocation(shim, args, "win32", {}), {
+      command: process.execPath, args: [target, ...args],
+    });
+    writeFileSync(shim, '"%~dp0nested.bat" %*\r\nnode "%~dp0\\..\\package space\\cli.cjs" %*\r\n');
+    assert.throws(() => portableInvocation(shim, args, "win32", {}), /cannot safely launch non-Node Windows command shim/);
+    writeFileSync(shim, '@ECHO off\r\n"%~dp0nested.bat" %*\r\n');
+    writeFileSync(nested, '"%~dp0pi.CMD" %*\r\n');
+    assert.throws(() => portableInvocation(shim, args, "win32", {}), /Windows command shim cycle/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("non-win32 is an untouched pass-through", () => {
   const r = portableInvocation("caveman", ["native-hook", "pi", "SessionStart"], "darwin", {});
@@ -80,6 +108,40 @@ test("win32: a real .exe is invoked directly", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// #1252: npm's cmd-shim forwards a package whose `bin` is a native executable
+// with one bare %*-terminated line and no interpreter. The hook bridge resolves
+// `caveman` through this helper, so a natively packaged CLI reached by a .cmd
+// shim was unlaunchable while the same command worked in the user's shell.
+test("win32: a cmd shim forwarding to a native .exe launches the exe itself (#1252)", () => {
+  const { root, bin } = fixture();
+  try {
+    const exe = join(bin, "caveman.exe");
+    writeFileSync(exe, "MZ native fixture");
+    writeFileSync(join(bin, "caveman.CMD"), [
+      "@ECHO off",
+      "SET dp0=%~dp0",
+      '"%dp0%\\caveman.exe"   %*',
+      "",
+    ].join("\r\n"));
+    const r = portableInvocation("caveman", ["native-hook", "pi", "Stop"], "win32", { PATH: bin, PATHEXT: ".CMD" });
+    // No process.execPath: a native binary is not a Node script.
+    assert.equal(r.command, exe);
+    assert.deepEqual(r.args, ["native-hook", "pi", "Stop"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("win32: only the bare .exe forwarding form is recognized (#1252)", () => {
+  assert.equal(parseWindowsExeShim('"%dp0%\\bin\\tool.exe"   %*\r\n'), "bin\\tool.exe");
+  assert.equal(parseWindowsExeShim('@"D:\\store\\tool.exe" %*\r\n'), "D:\\store\\tool.exe");
+  // A Node shim names its interpreter and script on one line; the anchored
+  // match cannot take node.exe for the forwarding target.
+  assert.equal(parseWindowsExeShim('@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"   "%~dp0\\cli.js" %*\r\n)\r\n'), null);
+  assert.equal(parseWindowsExeShim('"%~dp0tool.exe" %* & echo unsafe\r\n'), null);
+  assert.equal(parseWindowsExeShim('"%~dp0tool.ps1" %*\r\n'), null);
 });
 
 test("win32: a shim whose target cannot be parsed throws rather than spawning garbage", () => {
@@ -146,4 +208,32 @@ test("parseWindowsNodeShim reads both the shim-relative and drive-absolute forms
     "C:\\store\\caveman\\dist\\index.js",
   );
   assert.equal(parseWindowsNodeShim("@echo off\r\necho hi\r\n"), null);
+});
+
+// Node's own npx.cmd (npm 10.9.7 shape) and npm's shim for a native .exe bin.
+// The old copy of the helper here refused both with "non-Node Windows command shim".
+test("win32: stock npx.cmd runs its CLI script; an .exe-forwarding shim runs the .exe", () => {
+  const { root, bin } = fixture();
+  try {
+    const script = join(bin, "node_modules", "npm", "bin", "npx-cli.js");
+    mkdirSync(join(bin, "node_modules", "npm", "bin"), { recursive: true });
+    writeFileSync(script, "");
+    writeFileSync(join(bin, "npx.CMD"), [
+      "@ECHO OFF", "SETLOCAL", 'SET "NODE_EXE=%~dp0\\node.exe"',
+      'SET "NPX_CLI_JS=%~dp0\\node_modules\\npm\\bin\\npx-cli.js"', '"%NODE_EXE%" "%NPX_CLI_JS%" %*', "",
+    ].join("\r\n"));
+    const env = { PATH: bin, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
+    assert.deepEqual(portableInvocation("npx", ["-y", "a&b"], "win32", env), {
+      command: process.execPath, args: [script, "-y", "a&b"],
+    });
+    const exe = join(bin, "native", "caveman.exe");
+    mkdirSync(join(bin, "native"));
+    writeFileSync(exe, "MZ");
+    writeFileSync(join(bin, "caveman.CMD"), '@SETLOCAL\r\n@"%~dp0\\native\\caveman.exe"   %*\r\n');
+    assert.deepEqual(portableInvocation("caveman", ["native-hook", "pi", "Stop"], "win32", env), {
+      command: exe, args: ["native-hook", "pi", "Stop"],
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

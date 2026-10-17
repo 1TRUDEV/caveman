@@ -27,6 +27,10 @@ for _stream in (sys.stdout, sys.stderr):
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# A headless runner exports CLAUDE_CODE_ENTRYPOINT=sdk-*, which starts
+# SessionStart under the manual policy (#377) and would fail the hook flow.
+os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
 
 class CheckFailure(RuntimeError):
     pass
@@ -273,12 +277,23 @@ def verify_synced_files() -> None:
         )
 
     ensure(
-        (ROOT / "bin" / "install.js").exists(),
-        "bin/install.js missing — package.json bin entry would break npx caveman",
+        (ROOT / "installer" / "install.js").exists(),
+        "installer/install.js missing — package.json bin entry would break npx github:JuliusBrussee/caveman",
     )
     ensure(
-        (ROOT / "bin" / "lib" / "settings.js").exists(),
-        "bin/lib/settings.js missing — installer would crash on JSONC settings.json",
+        (ROOT / "installer" / "lib" / "settings.js").exists(),
+        "installer/lib/settings.js missing — installer would crash on JSONC settings.json",
+    )
+    # The Claude Code plugin root is the repo root (marketplace.json
+    # "source": "./"), so a tracked top-level bin/ ships inside the plugin:
+    # the CLI puts it on every plugin user's PATH, and claude.ai-hosted
+    # marketplaces reject the plugin outright (#1035). Tracked files only —
+    # gitignored files never reach a marketplace clone, and
+    # scripts/install-local-cli.sh writes its shim to .local-bin/ instead.
+    ensure(
+        not run(["git", "ls-files", "--", "bin"]).stdout.strip(),
+        "top-level bin/ ships inside the Claude plugin (plugin root = repo root) "
+        "and claude.ai-hosted marketplaces reject it; see #1035",
     )
 
     print("Synced copies, caveman.skill zip, and installer entrypoints OK")
@@ -291,12 +306,22 @@ def verify_manifests_and_syntax() -> None:
     manifest_paths = [
         claude_manifest_path,
         ROOT / ".claude-plugin/marketplace.json",
+        ROOT / ".cursor-plugin/plugin.json",
+        ROOT / "hooks/hooks-cursor.json",
         ROOT / ".codex/hooks.json",
         ROOT / "gemini-extension.json",
         ROOT / "plugins/caveman/.codex-plugin/plugin.json",
     ]
     for path in manifest_paths:
         read_json(path)
+
+    # The repo root is also the Claude Code plugin and Gemini extension root;
+    # both auto-load hooks/hooks.json, so one there would double-wire hooks.
+    ensure(
+        not (ROOT / "hooks/hooks.json").exists(),
+        "hooks/hooks.json is auto-loaded by Claude Code and Gemini; "
+        "Cursor's hook lives in hooks/hooks-cursor.json",
+    )
 
     claude_manifest = read_json(claude_manifest_path)
     ensure(isinstance(claude_manifest, dict), "Claude plugin manifest must be an object")
@@ -356,6 +381,7 @@ def verify_manifests_and_syntax() -> None:
         "caveman-statusline.sh",
         "caveman-statusline.ps1",
         "cavecrew-model-overrides.js",
+        "caveman-host-session-start.js",
     }
     manifest: dict[str, str] = {}
     for line in (hook_dir / "checksums.sha256").read_text(encoding="utf-8").splitlines():
@@ -371,8 +397,9 @@ def verify_manifests_and_syntax() -> None:
     run(["node", "--check", "src/hooks/caveman-activate.js"])
     run(["node", "--check", "src/hooks/caveman-mode-tracker.js"])
     run(["node", "--check", "src/hooks/cavecrew-model-overrides.js"])
-    run(["node", "--check", "bin/install.js"])
-    run(["node", "--check", "bin/lib/settings.js"])
+    run(["node", "--check", "src/hooks/caveman-host-session-start.js"])
+    run(["node", "--check", "installer/install.js"])
+    run(["node", "--check", "installer/lib/settings.js"])
     bash = shutil.which("bash")
     if bash is not None:
         run([bash, "-n", "src/hooks/install.sh"])
@@ -403,7 +430,8 @@ def verify_package_contents() -> None:
     ensure(isinstance(payload, list) and len(payload) == 1, "unexpected npm pack manifest")
     files = {entry["path"] for entry in payload[0]["files"]}
     required = {
-        "bin/install.js",
+        "installer/install.js",
+        ".codex/codex-sessionstart.js",  # Codex always-on hook payload (#573)
         "agents/cavecrew-investigator.md",
         "agents/cavecrew-builder.md",
         "agents/cavecrew-reviewer.md",
@@ -499,10 +527,10 @@ def verify_powershell_static() -> None:
 
     # The per-session store must be cleaned up by every uninstall path, or a
     # reinstall inherits stale modes for session ids that no longer exist.
-    installer_text = (ROOT / "bin/install.js").read_text(encoding="utf-8")
+    installer_text = (ROOT / "installer/install.js").read_text(encoding="utf-8")
     uninstall_sh_text = (ROOT / "src/hooks/uninstall.sh").read_text(encoding="utf-8")
     for name, text in (
-        ("bin/install.js", installer_text),
+        ("installer/install.js", installer_text),
         ("src/hooks/uninstall.sh", uninstall_sh_text),
         ("src/hooks/uninstall.ps1", uninstall_text),
     ):
@@ -678,6 +706,12 @@ def verify_hook_install_flow() -> None:
     section("Claude Hook Flow")
 
     ensure(shutil.which("node") is not None, "node is required for hook verification")
+    # Windows installs go through install.ps1. shutil.which("bash") here is often
+    # WSL's System32\bash.exe, which does not share the Windows temp home this
+    # check reads, so install.sh can exit 0 and leave SessionStart absent.
+    if os.name == "nt":
+        print("SKIP: POSIX hook install flow; Windows uses install.ps1")
+        return
     bash = shutil.which("bash")
     if bash is None:
         print("SKIP: Bash hook install flow requires Bash; native PowerShell path covered statically")
@@ -702,7 +736,12 @@ def verify_hook_install_flow() -> None:
         hooks = settings["hooks"]
         ensure(settings["statusLine"]["command"] == "bash /tmp/existing-statusline.sh", "install.sh clobbered existing statusLine")
         ensure("SessionStart" in hooks, "SessionStart hook missing after install")
+        ensure(
+            any("--subagent" in h.get("command", "") for e in hooks.get("SubagentStart", []) for h in e.get("hooks", [])),
+            "SubagentStart hook missing after install",
+        )
         ensure("UserPromptSubmit" in hooks, "UserPromptSubmit hook missing after install")
+        ensure("SessionEnd" in hooks, "SessionEnd hook missing after install")
 
         activate = run(
             ["node", "src/hooks/caveman-activate.js"],
@@ -1073,6 +1112,49 @@ def verify_untrusted_git_invocations() -> None:
     print(f"{len(sources)} sources checked; git only reaches untrusted repositories through {len(wrappers)} hardened wrappers")
 
 
+def verify_hidden_child_windows() -> None:
+    """#1214: no host-side child process may open a console window on Windows.
+
+    A hook or in-process extension runs inside a host that often has no console
+    of its own (Claude Code desktop, OpenCode under a multiplexer, a GUI
+    launcher). Windows then gives every console child a NEW console window, so
+    the user gets one flashing window per prompt, tool call or bash command.
+    `windowsHide: true` suppresses it and is ignored on every other platform.
+
+    These files have no shared runtime with the CLI that already sets the
+    option, so each spawn carries its own literal — exactly the shape that
+    drifts. The generated plugin templates are guarded behaviorally instead, by
+    assertHidesChildWindows in packages/cli/tests, because they are emitted as
+    text and only the written artifact proves what a user actually runs.
+    """
+    section("Hidden Child Windows (Windows console flash)")
+    call_re = re.compile(r"\b(?:execFileSync|execSync|spawnSync|execFile|spawn)\s*\(")
+    targets = [
+        ROOT / "src/hooks/caveman-mode-tracker.js",
+        ROOT / "src/mcp-servers/caveman-shrink/index.js",
+        ROOT / "packages/pi-extension/src/recovery.ts",
+        ROOT / "packages/pi-extension/src/lifecycle.ts",
+    ]
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        # An import/destructure of the API is not a call site.
+        body = "\n".join(
+            line for line in text.splitlines()
+            if "require(" not in line and not line.lstrip().startswith("import ")
+        )
+        calls = len(call_re.findall(body))
+        if calls == 0:
+            continue
+        hidden = body.count("windowsHide: true") + body.count("getSpawnOptions()")
+        ensure(
+            hidden >= calls,
+            f"{path.relative_to(ROOT)}: {calls} child-process call(s) but {hidden} "
+            "windowsHide/getSpawnOptions — a host child must not open a console window (#1214)",
+        )
+        print(f"  {path.relative_to(ROOT)}: {calls} call(s) hidden")
+    print("Hidden child window checks OK")
+
+
 def main() -> int:
     checks = [
         verify_license_boundaries,
@@ -1085,6 +1167,7 @@ def main() -> int:
         verify_manifests_and_syntax,
         verify_package_contents,
         verify_powershell_static,
+        verify_hidden_child_windows,
         verify_python_text_io_encoding,
         verify_compress_fixtures,
         verify_compress_cli,

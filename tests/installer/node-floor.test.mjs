@@ -2,7 +2,7 @@
 // then runs under it. It must not persist an interpreter below the package's
 // supported runtime floor.
 //
-// The floor lives in bin/install.js as MIN_NODE_MAJOR rather than being read
+// The floor lives in installer/install.js as MIN_NODE_MAJOR rather than being read
 // from package.json at runtime, because that file also runs detached from a
 // checkout (the curl fallback path). These tests are what keep the constant
 // and `engines.node` from drifting apart, and what prove the guard is applied.
@@ -14,15 +14,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isolatedEnv } from './_isolated-env.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
-const INSTALLER = path.join(REPO_ROOT, 'bin', 'install.js');
+const INSTALLER = path.join(REPO_ROOT, 'installer', 'install.js');
 
 function installerMinNodeMajor() {
   const src = fs.readFileSync(INSTALLER, 'utf8');
   const m = /const MIN_NODE_MAJOR = (\d+);/.exec(src);
-  assert.ok(m, 'MIN_NODE_MAJOR not found in bin/install.js');
+  assert.ok(m, 'MIN_NODE_MAJOR not found in installer/install.js');
   return Number(m[1]);
 }
 
@@ -35,7 +36,7 @@ test('MIN_NODE_MAJOR matches the engines.node floor in package.json', () => {
   assert.equal(
     installerMinNodeMajor(),
     Number(declared[1]),
-    `bin/install.js MIN_NODE_MAJOR drifted from package.json engines.node (${engines})`
+    `installer/install.js MIN_NODE_MAJOR drifted from package.json engines.node (${engines})`
   );
 });
 
@@ -63,7 +64,7 @@ test('a PATH node below the engines floor is not persisted', { skip: process.pla
       INSTALLER, '--only', 'claude', '--with-hooks', '--skip-skills',
       '--config-dir', configDir, '--non-interactive', '--no-mcp-shrink',
     ], {
-      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH || ''}`, CLAUDE_CONFIG_DIR: configDir, NO_COLOR: '1' },
+      env: { ...isolatedEnv(path.join(dir, 'home'), [fakeBin]), CLAUDE_CONFIG_DIR: configDir },
       encoding: 'utf8',
     });
     assert.notEqual(r.status, 2, `installer aborted on argv parse: ${r.stderr}`);

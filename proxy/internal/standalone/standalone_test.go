@@ -34,8 +34,11 @@ type captureUpstreamTransport struct {
 }
 
 func (t *captureUpstreamTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	body, _ := io.ReadAll(r.Body)
-	t.body = append([]byte(nil), body...)
+	t.body = nil
+	if r.Body != nil { // metadata GETs forward with no body
+		body, _ := io.ReadAll(r.Body)
+		t.body = append([]byte(nil), body...)
+	}
 	t.headers = r.Header.Clone()
 	t.url = r.URL.String()
 	status := t.status
@@ -720,6 +723,13 @@ func TestCreds_PassthroughThenBYOK(t *testing.T) {
 	}
 }
 
+func TestProviderUpstreamsPublishesChatGPTSubscriptionProof(t *testing.T) {
+	upstreams := ProviderUpstreams(config.Config{})
+	if got := upstreams["openai-codex"]; got != "https://chatgpt.com/backend-api" {
+		t.Fatalf("openai-codex upstream = %q, want ChatGPT backend base", got)
+	}
+}
+
 func TestBuildAdapters_RegistersNamedCompatBeforeLegacy(t *testing.T) {
 	cfg := config.Config{
 		Compat: map[string]config.CompatConfig{
@@ -924,7 +934,7 @@ func TestBuildAdapters_RegistersBedrockFromResolvedRegion(t *testing.T) {
 	t.Setenv("AWS_DEFAULT_REGION", "us-east-2")
 	adapters := buildAdapters(config.Config{})
 
-	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse", nil)
+	req := httptest.NewRequest(http.MethodPost, "/bedrock/model/global.anthropic.claude-sonnet-4-6/converse", nil)
 	for _, adapter := range adapters {
 		if adapter.Name() != "bedrock" {
 			continue
@@ -936,7 +946,7 @@ func TestBuildAdapters_RegistersBedrockFromResolvedRegion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolve Bedrock route: %v", err)
 		}
-		want := "https://bedrock-runtime.eu-west-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
+		want := "https://bedrock-runtime.eu-west-1.amazonaws.com/model/global.anthropic.claude-sonnet-4-6/converse"
 		if got := upstream.String(); got != want {
 			t.Fatalf("Bedrock upstream = %q, want %q", got, want)
 		}
@@ -1550,6 +1560,25 @@ func TestStandaloneOpenCodeGoAuthEndToEnd(t *testing.T) {
 			wantHeaders: map[string]string{
 				"x-opencode-session": "ses_chat",
 				"x-opencode-client":  "pi",
+			},
+		},
+		{
+			// `caveman enable opencode` and `caveman wrap opencode` route
+			// OpenCode's own opencode-go provider through this mount (#1090).
+			name:     "opencode agent responses forwards the OpenCode session headers",
+			path:     "/w/opencode/compat/opencode-go/v1/responses",
+			body:     responsesBody,
+			response: responsesResponse,
+			inbound: map[string]string{
+				"authorization":      "Bearer sk-inbound",
+				"x-opencode-session": "ses_opencode",
+				"x-opencode-client":  "cli",
+			},
+			wantURL:  "https://opencode.ai/zen/go/v1/responses",
+			wantAuth: "Bearer sk-inbound",
+			wantHeaders: map[string]string{
+				"x-opencode-session": "ses_opencode",
+				"x-opencode-client":  "cli",
 			},
 		},
 		{

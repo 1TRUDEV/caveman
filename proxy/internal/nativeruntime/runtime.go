@@ -116,6 +116,10 @@ type Runtime struct {
 	// engine could do with it. Deterministic, local, no store and no network. A
 	// nil detect means "cannot classify", which masks — see maskWouldDiscardFacts.
 	detect func([]byte) string
+	// OnTurnStart, when set, runs on every session.start and prompt.submit,
+	// before the model request they announce (the Cloud link warms its route
+	// path). It must not block.
+	OnTurnStart func()
 }
 
 type sessionActivity struct {
@@ -285,6 +289,9 @@ func (r *Runtime) Handle(_ context.Context, request Request) (Response, error) {
 		DecisionID:      decisionID(request, request.Event.Type),
 	}
 	err = nil
+	if r.OnTurnStart != nil && (request.Event.Type == "session.start" || request.Event.Type == "prompt.submit") {
+		r.OnTurnStart()
+	}
 	switch request.Event.Type {
 	case "session.start":
 		if features.repository {
@@ -1225,7 +1232,9 @@ func (r *Runtime) afterTool(request Request, response Response, allowMask bool) 
 //
 // Only classes with a field grammar qualify, because only those produce
 // invariants: JSON records, CSV/TSV/markdown rows, and line-oriented logs
-// (logfmt and NDJSON both, via the log compressor's per-line reader). Everything
+// (logfmt and NDJSON both, via the log compressor's per-line reader), plus test
+// reports, whose compressor keeps every failure and the counts (pytest/Jest JSON
+// took this path as plain JSON before test-report existed). Everything
 // else — text, code, diff, terminal, HTML, config, search results, and anything
 // undetected — keeps today's masking behaviour exactly.
 //
@@ -1236,7 +1245,7 @@ func (r *Runtime) maskWouldDiscardFacts(output []byte) bool {
 		return false // cannot classify -> behave exactly as before
 	}
 	switch r.detect(output) {
-	case engine.TypeJSON, engine.TypeTabular, engine.TypeLog:
+	case engine.TypeJSON, engine.TypeTabular, engine.TypeLog, engine.TypeTestReport:
 		return true
 	default:
 		return false

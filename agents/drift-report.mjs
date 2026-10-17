@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // drift-report.mjs — turn a `probe-installed --allow-newer --json` result into one
-// GitHub issue per DRIFTED agent (the installed @latest binary is newer than the pinned
-// tested_agent_version). Idempotent: one open issue per agent id, updated in place rather
-// than duplicated. Non-blocking by design — the caller runs it with continue-on-error, and
-// this script never exits non-zero on a `gh` hiccup, only on bad input.
+// GitHub issue per agent whose @latest binary is DRIFTED (newer than the pinned
+// tested_agent_version) or BROKEN (failed to launch, or not newer than the pin).
+// Idempotent: one open issue per agent id, updated in place rather than duplicated.
+// Non-blocking by design — the caller runs it with continue-on-error, and this script
+// never exits non-zero on a `gh` hiccup, only on bad input.
 //
 // Usage: node agents/drift-report.mjs --input <probe.json>
 // Requires the `gh` CLI authenticated (GH_TOKEN) with `issues: write`.
@@ -150,11 +151,14 @@ if (!expectedResult || expectedResult.status === "not-installed") {
 
 // No issue-write-capable subprocess runs before every byte of the downloaded artifact
 // has passed the closed validation above.
-const drifted = expectedResult.status === "drift" ? [expectedResult] : [];
+const drifted = expectedResult.status === "drift" || expectedResult.status === "broken" ? [expectedResult] : [];
 if (drifted.length === 0) {
   process.stdout.write("drift-report: no drift observed\n");
   process.exit(0);
 }
+const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+  ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+  : "";
 
 function gh(argv) {
   const result = spawnSync("gh", argv, { encoding: "utf8" });
@@ -162,18 +166,53 @@ function gh(argv) {
 }
 
 for (const r of drifted) {
-  const title = `agent-drift: ${r.id} — installed ${r.observed} exceeds pinned ${r.tested}`;
+  const broken = r.status === "broken";
+  const observed = r.observed || "unknown";
+  const title = broken
+    ? `agent-drift: ${r.id} — installed ${observed} fails the latest probe (pinned ${r.tested})`
+    : `agent-drift: ${r.id} — installed ${r.observed} exceeds pinned ${r.tested}`;
   const marker = `<!-- caveman-agent-drift:${r.id} -->`;
+  // The state line doubles as the "already current" key below, so drift and broken
+  // at the same version must not be the same line.
+  const stateLine = `- installed (@latest): \`${observed}\`${broken ? " (probe broken)" : ""}`;
+  // A broken probe has exactly one of two causes and the artifact already says which:
+  // a surface that did not launch, or a clean launch that yielded no newer version.
+  // Reporting them as a disjunction ("it did not launch ... or ...") contradicted the
+  // flags printed beside it and made the maintainer re-run the probe to find out
+  // which it was (#1236).
+  const unlaunchable = broken
+    ? [...(r.version_ok ? [] : ["`--version`"]), ...(r.help_ok ? [] : ["`--help`"])]
+    : [];
+  const launched = [...(r.version_ok ? ["`--version`"] : []), ...(r.help_ok ? ["`--help`"] : [])];
+  let brokenSentence = null;
+  if (!broken) {
+    // Not computed for a drift result: every branch below describes a probe
+    // failure, and a drift result is a clean probe.
+  } else if (unlaunchable.length === 0) {
+    brokenSentence = `The \`${r.id}\` @latest binary launched on both \`--version\` and \`--help\`, but the version it reported (\`${observed}\`) is not newer than the pin, so the probe cannot confirm a drift.`;
+  } else if (launched.length === 0) {
+    brokenSentence = `The \`${r.id}\` @latest binary installed, but neither \`--version\` nor \`--help\` launched under the isolated probe environment.`;
+  } else {
+    brokenSentence = `The \`${r.id}\` @latest binary installed and ${launched.join(" and ")} launched, but ${unlaunchable.join(" and ")} failed under the isolated probe environment.`;
+  }
+  // version_error/help_error stay out of the issue: they are untrusted upstream output.
   const body = [
     marker,
     "",
-    `The \`${r.id}\` upstream released a version newer than the pin the profile claims to test.`,
+    broken
+      ? brokenSentence
+      : `The \`${r.id}\` upstream released a version newer than the pin the profile claims to test.`,
     "",
-    `- installed (@latest): \`${r.observed}\``,
+    stateLine,
     `- profile \`tested_agent_version\`: \`${r.tested}\``,
+    ...(broken && runUrl ? [`- probe run (artifact \`agent-probe-${r.id}\`): ${runUrl}`] : []),
     "",
     "This is a non-blocking drift report from the nightly Agent conformance workflow. To clear it:",
-    `1. Verify \`${r.id}@${r.observed}\` wraps correctly.`,
+    broken
+      ? (unlaunchable.length
+        ? `1. Find why ${unlaunchable.join(" and ")} fails for \`${r.id}@latest\`; the captured output is in the probe artifact, not copied here. If the latest-drift install line tracks something other than a release, point it at one.`
+        : `1. Find why the probe could not read a newer version for \`${r.id}@latest\`; if the latest-drift install line tracks something other than a release, point it at one.`)
+      : `1. Verify \`${r.id}@${r.observed}\` wraps correctly.`,
     `2. Bump \`tested_agent_version\` in \`agents/profiles/${r.id}.json\` (the conformance CI pin is derived from it and enforced by \`compile.mjs\`).`,
     `3. Update \`last_verified_at\`/\`verified_by\` if the profile carries them.`,
   ].join("\n");
@@ -199,7 +238,8 @@ for (const r of drifted) {
   }
 
   if (existing) {
-    if ((existing.body || "").includes(`installed (@latest): \`${r.observed}\``)) {
+    // GitHub returns CRLF bodies once an issue is edited in the web UI.
+    if ((existing.body || "").split(/\r?\n/).includes(stateLine)) {
       process.stdout.write(`drift-report: ${r.id} issue #${existing.number} already current\n`);
       continue;
     }

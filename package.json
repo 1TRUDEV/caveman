@@ -1,6 +1,6 @@
 {
   "name": "caveman-installer",
-  "version": "3.1.0",
+  "version": "4.0.1",
   "description": "Caveman installer \u2014 detects your AI coding agents and installs caveman for each one.",
   "license": "Apache-2.0",
   "author": "Julius Brussee",
@@ -13,7 +13,7 @@
     "url": "https://github.com/JuliusBrussee/caveman/issues"
   },
   "bin": {
-    "caveman-install": "./bin/install.js"
+    "caveman-install": "./installer/install.js"
   },
   "engines": {
     "node": ">=18"
@@ -23,7 +23,10 @@
     "test:windows": "node scripts/test-windows-compat.mjs"
   },
   "files": [
-    "bin/",
+    ".cursor-plugin/",
+    "installer/",
+    ".codex/codex-sessionstart.js",
+    "hooks/",
     "src/",
     "agents/",
     "skills/",
@@ -38,6 +41,6 @@
   ],
   "packageManager": "pnpm@10.14.0",
   "dependencies": {
-    "@caveman-ai/cli": "^1.1.0"
+    "@caveman-ai/cli": "^4.0.0"
   }
 }

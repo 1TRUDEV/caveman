@@ -14,7 +14,8 @@ const MODELS = [
   { provider: "relay", id: "default", api: "openai-completions", baseUrl: "http://127.0.0.1:4000/v1" },
   { provider: "relay", id: "foreign", api: "openai-completions", baseUrl: "http://127.0.0.1:4001/v1" },
 ];
-const NATIVE = { openai: "https://api.openai.com" };
+const NATIVE = { openai: "https://api.openai.com", "openai-codex": "https://chatgpt.com/backend-api" };
+const CODEX_MODEL = { provider: "openai-codex", id: "gpt-fixture", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" };
 const COMPAT = { relay: "http://127.0.0.1:4000" };
 
 // Pi assigns the active model before emitting model_select. Keep that model
@@ -74,6 +75,34 @@ test("route only the selected model; a same-provider foreign endpoint stays dire
   assert.deepEqual(h.registry, MODELS);
 });
 
+// Pi's setModel re-derives thinking from settings; routing must not cost the
+// user the level they started the session with.
+test("routing and restoring keep the session's thinking level", async () => {
+  let level = "high";
+  let active = { ...MODELS[0] };
+  const ctx = {
+    get model() { return active; },
+    modelRegistry: {
+      getAll: () => MODELS,
+      find: (provider, id) => MODELS.find((model) => model.provider === provider && model.id === id),
+      isUsingOAuth: () => false,
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-local-test-key" }),
+    },
+  };
+  const pi = {
+    getThinkingLevel: () => level,
+    setThinkingLevel: (value) => { level = value; },
+    async setModel(model) { active = model; level = "low"; return true; },
+  };
+  const router = new ProviderRouter(pi, () => {});
+  await router.openGate(GATEWAY, ctx, COMPAT, NATIVE);
+  assert.equal(active.baseUrl, ROUTE);
+  assert.equal(level, "high", "routing reset the thinking level");
+  await router.closeGate(ctx);
+  assert.equal(active.baseUrl, MODELS[0].baseUrl);
+  assert.equal(level, "high", "restoring direct mode reset the thinking level");
+});
+
 test("provider switches and closeGate preserve registry and restore active endpoint", async () => {
   const models = [...MODELS, { provider: "openai", id: "gpt-fixture", api: "openai-responses", baseUrl: "https://api.openai.com/v1" }];
   const h = harness(models);
@@ -86,15 +115,55 @@ test("provider switches and closeGate preserve registry and restore active endpo
   assert.deepEqual(h.registry, models);
 });
 
-test("OAuth and unknown auth restore the active routed model before claiming direct mode", async () => {
-  for (const auth of [true, new Error("auth status unavailable")]) {
+test("OAuth and unknown auth outside the verified subscription route stay direct", async () => {
+  for (const [auth, reason] of [
+    [true, /OAuth\/subscription credentials are not routed/],
+    [new Error("auth status unavailable"), /authentication type could not be verified/],
+  ]) {
     const h = harness();
     await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
     h.setOAuth(auth);
     await h.router.apply(h.ctx.model, h.ctx);
     assert.equal(h.router.routing(), false);
     assert.deepEqual(h.ctx.model, MODELS[0]);
-    assert.match(h.notices.at(-1), /OAuth\/subscription credentials are not routed/);
+    assert.match(h.notices.at(-1), reason);
+  }
+});
+
+test("verified openai-codex OAuth routes without resolving an API key", async () => {
+  const h = harness([CODEX_MODEL]);
+  h.setOAuth(true);
+  h.setAuthBehavior(() => { throw new Error("OAuth route must not resolve an API key"); });
+  await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+  assert.equal(h.router.routing(), true, h.notices.join("\n"));
+  assert.equal(h.ctx.model.baseUrl, `${GATEWAY}/w/pi`);
+  assert.equal(await h.router.closeGate(h.ctx), true);
+  assert.deepEqual(h.ctx.model, CODEX_MODEL);
+});
+
+test("openai-codex stays direct without proxy proof, OAuth certainty, or subscription auth", async () => {
+  {
+    const h = harness([CODEX_MODEL]);
+    h.setOAuth(true);
+    await h.router.openGate(GATEWAY, h.ctx, COMPAT, { openai: NATIVE.openai });
+    assert.equal(h.router.routing(), false);
+    assert.deepEqual(h.ctx.model, CODEX_MODEL);
+    assert.match(h.notices.at(-1), /not verified by the running proxy/);
+  }
+  {
+    const h = harness([CODEX_MODEL]);
+    h.setOAuth(new Error("auth status unavailable"));
+    await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+    assert.equal(h.router.routing(), false);
+    assert.match(h.notices.at(-1), /authentication type could not be verified/);
+  }
+  {
+    const h = harness([CODEX_MODEL]);
+    h.setOAuth(false);
+    h.setAuthBehavior(() => { throw new Error("subscription route must not resolve an API key"); });
+    await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+    assert.equal(h.router.routing(), false);
+    assert.match(h.notices.at(-1), /ChatGPT subscription route requires OAuth/);
   }
 });
 
@@ -178,6 +247,48 @@ test("unlisted providers stay direct with an actionable mount notice", async () 
   assert.equal(h.router.routing(), false);
   assert.equal(h.ctx.model.baseUrl, "http://127.0.0.1:1/v1");
   assert.match(h.notices.at(-1), /no compat mount named "unlisted-relay".*add compat\.unlisted-relay\.base_url/);
+});
+
+test("a provider whose baseUrl is a sentinel is not offered a compat mount", async () => {
+  const bridge = { provider: "claude-bridge", id: "m", api: "anthropic-messages", baseUrl: "claude-bridge" };
+  const h = harness([bridge]);
+  await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+  assert.equal(h.router.routing(), false);
+  assert.deepEqual(h.ctx.model, bridge);
+  assert.match(h.notices.at(-1), /"claude-bridge" is not an HTTP URL/);
+  assert.doesNotMatch(h.notices.at(-1), /compat\.claude-bridge\.base_url|no compat mount named/);
+});
+
+// #1212: before 2.x, routing a custom provider meant pointing its baseUrl at
+// the gateway's own /w/pi wedge. Those configs survive the upgrade, and the
+// compat lookup then fails on the provider NAME, so the user was told to add
+// compat.<provider>.base_url — a remedy that cannot work here, because the
+// value it configures is the proxy's own URL rather than an upstream. Naming
+// the real cause is the difference between a fixable config and a dead end.
+test("a provider already pointed at the Caveman proxy is told so, not to add a mount", async () => {
+  const selfRouted = { provider: "lego-claude", id: "eu.anthropic.claude-opus-5-5", api: "anthropic-messages", baseUrl: `${GATEWAY}/w/pi` };
+  const h = harness([selfRouted]);
+  await h.router.openGate(GATEWAY, h.ctx, COMPAT, NATIVE);
+  assert.equal(h.router.routing(), false);
+  assert.deepEqual(h.ctx.model, selfRouted, "an unroutable model must keep its own endpoint");
+  assert.match(h.notices.at(-1), /points at the Caveman proxy itself/);
+  // The mount is step two, never the whole remedy: adding it while baseUrl still
+  // names the proxy aims the proxy at itself, which is the dead end #1212 hit.
+  assert.match(h.notices.at(-1), /set it to the real upstream and add compat\.lego-claude\.base_url/);
+  assert.doesNotMatch(h.notices.at(-1), /no compat mount named/);
+});
+
+// The same confusion with a LISTED provider name reaches a different branch of
+// the same chain (`expected` resolves, so the host mismatch answers first) and
+// produced "provider endpoint 127.0.0.1:8787 is not api.anthropic.com" — true,
+// but it buries the cause: that host IS the proxy the user is trying to use.
+test("a listed provider pointed at the proxy names the proxy, not a host mismatch", async () => {
+  const selfRouted = { provider: "anthropic", id: "claude-fixture", api: "anthropic-messages", baseUrl: `${GATEWAY}/w/pi/anthropic` };
+  const h = harness([selfRouted]);
+  await h.router.openGate(GATEWAY, h.ctx, COMPAT, { ...NATIVE, anthropic: "https://api.anthropic.com" });
+  assert.equal(h.router.routing(), false);
+  assert.match(h.notices.at(-1), /points at the Caveman proxy itself/);
+  assert.doesNotMatch(h.notices.at(-1), /is not api\.anthropic\.com/);
 });
 
 const CUSTOM_HEADERS = { "X-API-Tenant": "private-fixture-tenant", "CF-AIG-Authorization": "private-fixture-auth" };

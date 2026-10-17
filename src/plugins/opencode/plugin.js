@@ -45,7 +45,7 @@ import path from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 
 // When installed: caveman-config.cjs sits next to plugin.js (copied by
-// bin/install.js, renamed to .cjs because this directory's package.json
+// installer/install.js, renamed to .cjs because this directory's package.json
 // declares "type": "module" — bare .js would be loaded as ESM). When loaded
 // from the source tree (tests, dev): fall back to the canonical
 // src/hooks/caveman-config.js, which lives in a directory whose own
@@ -303,7 +303,11 @@ export const CavemanPlugin = async (_ctx) => {
   // here means the flag is rewritten on every new session, not just once when
   // the plugin module loads. See https://opencode.ai/docs/plugins#events.
   event: async ({ event } = {}) => {
-    if (event && event.type === 'session.created') handleSessionCreated();
+    // A subagent is a session too (opencode 2: data.parentID, 1.x:
+    // properties.info.parentID). Resetting the flag for one would undo the
+    // user's "stop caveman" or /ultracave every time the model delegates.
+    const parentID = event?.data?.parentID ?? event?.properties?.info?.parentID;
+    if (event && event.type === 'session.created' && !parentID) handleSessionCreated();
   },
 
   // Intercept user messages to detect /caveman commands and natural-language
