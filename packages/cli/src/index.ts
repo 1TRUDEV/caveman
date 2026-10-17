@@ -20120,10 +20120,14 @@ function resolveCavememCommand(): { command: string; args: string[] } {
 // cavememRun shells to cavemem and returns its stdout. On failure it surfaces the
 // error honestly and exits — except in soft mode (the recall hook), where it
 // returns null so the hook can no-op without ever blocking the agent.
-function cavememRun(memArgs: string[], opts: { soft?: boolean } = {}): string | null {
+function cavememRun(memArgs: string[], opts: { soft?: boolean; stdin?: boolean } = {}): string | null {
   const { command, args: pre } = resolveCavememCommand();
   try {
-    return execFileSync(command, [...pre, ...memArgs], { encoding: "utf8", env: process.env });
+    return execFileSync(command, [...pre, ...memArgs], {
+      encoding: "utf8",
+      env: process.env,
+      stdio: [opts.stdin ? "inherit" : "pipe", "pipe", "pipe"],
+    });
   } catch (error) {
     const e = error as { stdout?: string; stderr?: string; status?: number; message?: string };
     if (opts.soft) return null;
@@ -20148,9 +20152,15 @@ function mem(rest: string[]) {
       // fall back to dropping flag-looking args (remember takes none) for
       // backward compatibility.
       const args = rest.slice(1);
+      // --stdin hands our stdin straight to cavemem, so the block reaches the
+      // store byte for byte and never passes through a shell command line.
+      if (args.length === 1 && args[0] === "--stdin") {
+        process.stdout.write(cavememRun(["remember", "--stdin"], { stdin: true }) ?? "");
+        return;
+      }
       const sep = args.indexOf("--");
       const text = (sep >= 0 ? args.slice(sep + 1) : args.filter((a) => !a.startsWith("--"))).join(" ");
-      if (!text) { console.error(`usage: ${invokedCommand("mem")} remember [--] <text>`); process.exit(2); }
+      if (!text) { console.error(`usage: ${invokedCommand("mem")} remember [--] <text> | --stdin`); process.exit(2); }
       process.stdout.write(cavememRun(["remember", text]) ?? "");
       return;
     }
@@ -20223,6 +20233,7 @@ function memRecover(handle: string) {
 function memUsage() {
   console.log(`caveman mem — durable agent memory (cavemem)
   caveman mem remember <text>              store a memory
+  caveman mem remember --stdin             store a memory read from stdin, byte for byte
   caveman mem recall <query> [--limit N]   recall memories (lexical, conservative threshold)
   caveman mem supersede <id> <text>        replace a current fact; preserve history
   caveman mem history <id>                 show oldest-to-newest versions
